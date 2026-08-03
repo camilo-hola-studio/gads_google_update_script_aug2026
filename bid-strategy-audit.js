@@ -621,27 +621,25 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
     sh.getRange(hdrRow + 1, 4, out.length, 4).setNumberFormat('#,##0.00');
     sh.getRange(hdrRow + 1, 8, out.length, 1).setNumberFormat('0.0%');
 
-    // Same watercolour wash as Campaign Data: full row tinted for the
-    // actionable set, a shade deeper when the trend says "1 - Act now".
-    // Applied before the trend-cell colours so those keep their own fill.
-    list.forEach(function(c, i) {
-      if (!c.actionable) return;
-      var urgent = c.priority === '1 - Act now';
-      sh.getRange(hdrRow + 1 + i, 1, 1, headers.length)
-          .setBackground(urgent ? '#B9F5FC' : '#E0FBFE');
+    // Watercolour wash (full row for the actionable set, deeper when the
+    // trend says "1 - Act now") and the trend-cell red/amber/green, built as
+    // ONE 2D array and written with a single setBackgrounds call - per-cell
+    // writes cost ~100ms each and dominate runtime on big accounts.
+    var bg = list.map(function(c) {
+      var wash = c.actionable
+          ? (c.priority === '1 - Act now' ? '#B9F5FC' : '#E0FBFE')
+          : null;
+      var row = [];
+      for (var k = 0; k < headers.length; k++) row.push(wash);
+      // Column 8 = Trend 30d>7d: grey for no-target/low-spend/no-data rows,
+      // red/amber/green on the priority thresholds otherwise.
+      if (!c.hasTarget || !c.aboveFloor || c.trend == null) row[7] = COLORS.GREY;
+      else if (c.trend <= -0.20) row[7] = COLORS.RED;
+      else if (c.trend <= -0.10) row[7] = COLORS.AMBER;
+      else row[7] = COLORS.GREEN;
+      return row;
     });
-
-    // "Conditional formatting" applied deterministically per row: red/amber/
-    // green on the priority thresholds for flagged rows, grey for no-target
-    // and low-spend rows.
-    list.forEach(function(c, i) {
-      var cell = sh.getRange(hdrRow + 1 + i, 8);
-      if (!c.hasTarget || !c.aboveFloor) cell.setBackground(COLORS.GREY);
-      else if (c.trend == null) cell.setBackground(COLORS.GREY);
-      else if (c.trend <= -0.20) cell.setBackground(COLORS.RED);
-      else if (c.trend <= -0.10) cell.setBackground(COLORS.AMBER);
-      else cell.setBackground(COLORS.GREEN);
-    });
+    sh.getRange(hdrRow + 1, 1, bg.length, headers.length).setBackgrounds(bg);
     tableStyle_(sh, hdrRow, 1, out.length + 1, headers.length);
   } else {
     sh.getRange(hdrRow + 1, 1).setValue('No enabled campaigns found in this account.');
@@ -764,29 +762,32 @@ function buildWeeklySection_(sh, primaryMetric, currency, weekly) {
   var lastRow = tblStart + weeks.length - 1;
   var yA1 = '$P$' + tblStart + ':$P$' + lastRow;   // Actual column
   var xA1 = '$M$' + tblStart + ':$M$' + lastRow;   // wk# column
+  // Values and formulas accumulated per row, then written in two batched
+  // calls (setValues + setFormulas) instead of ~6 per-cell writes per week.
+  var idxWeek = [];
+  var formulas = [];
   weeks.forEach(function(w, i) {
     var row = tblStart + i;
     var wk = ',' + rawA1('S') + ',$N' + row;
-    sh.getRange(row, IDX_COL).setValue(i + 1);
-    sh.getRange(row, TBL_COL).setValue(w);
-    sh.getRange(row, TBL_COL + 1).setFormula(
-        '=IFERROR(SUMIFS(' + rawA1('X') + wk + crit + ')/SUMIFS(' +
-        rawA1('U') + wk + crit + '),"")');
-    sh.getRange(row, TBL_COL + 2).setFormula(primaryMetric === 'ROAS'
-        ? '=IFERROR(SUMIFS(' + rawA1('V') + wk + crit + ')/SUMIFS(' +
-          rawA1('U') + wk + crit + '),"")'
-        : '=IFERROR(SUMIFS(' + rawA1('U') + wk + crit + ')/SUMIFS(' +
-          rawA1('W') + wk + crit + '),"")');
-    // Gap vs target, same direction convention as every other tab: beating
-    // the target reads positive for both ROAS and CPA.
-    sh.getRange(row, TBL_COL + 3).setFormula(primaryMetric === 'ROAS'
-        ? '=IFERROR(($P' + row + '-$O' + row + ')/$O' + row + ',"")'
-        : '=IFERROR(($O' + row + '-$P' + row + ')/$O' + row + ',"")');
-    sh.getRange(row, TBL_COL + 4).setFormula(
-        '=IFERROR(TREND(' + yA1 + ',' + xA1 + ',$M' + row + '),"")');
+    idxWeek.push([i + 1, w]);
+    formulas.push([
+      '=IFERROR(SUMIFS(' + rawA1('X') + wk + crit + ')/SUMIFS(' +
+          rawA1('U') + wk + crit + '),"")',
+      primaryMetric === 'ROAS'
+          ? '=IFERROR(SUMIFS(' + rawA1('V') + wk + crit + ')/SUMIFS(' +
+            rawA1('U') + wk + crit + '),"")'
+          : '=IFERROR(SUMIFS(' + rawA1('U') + wk + crit + ')/SUMIFS(' +
+            rawA1('W') + wk + crit + '),"")',
+      // Gap vs target, same direction convention as every other tab: beating
+      // the target reads positive for both ROAS and CPA.
+      primaryMetric === 'ROAS'
+          ? '=IFERROR(($P' + row + '-$O' + row + ')/$O' + row + ',"")'
+          : '=IFERROR(($O' + row + '-$P' + row + ')/$O' + row + ',"")',
+      '=IFERROR(TREND(' + yA1 + ',' + xA1 + ',$M' + row + '),"")'
+    ]);
   });
-  sh.getRange(tblStart, IDX_COL, weeks.length, 1)
-      .setFontColor('#999999').setFontSize(8);
+  sh.getRange(tblStart, IDX_COL, idxWeek.length, 2).setValues(idxWeek);
+  sh.getRange(tblStart, TBL_COL + 1, formulas.length, 4).setFormulas(formulas);
   sh.getRange(tblStart, TBL_COL + 1, weeks.length, 2)
       .setNumberFormat('#,##0.00');
   sh.getRange(tblStart, TBL_COL + 3, weeks.length, 1).setNumberFormat('0.0%');
@@ -965,13 +966,17 @@ function buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost) {
     // Full-row watercolour wash on campaigns that need acting on, so they
     // jump out of a long list. Soft blue for the actionable set (the same
     // campaigns that appear on the Actionable tab), deepening slightly when
-    // the trend also says "1 - Act now".
-    list.forEach(function(c, i) {
-      if (!c.actionable) return;
-      var urgent = c.priority === '1 - Act now';
-      sh.getRange(3 + i, 1, 1, headers.length)
-          .setBackground(urgent ? '#B9F5FC' : '#E0FBFE');
+    // the trend also says "1 - Act now". One batched setBackgrounds call,
+    // not per-row writes.
+    var bg = list.map(function(c) {
+      var wash = c.actionable
+          ? (c.priority === '1 - Act now' ? '#B9F5FC' : '#E0FBFE')
+          : null;
+      var row = [];
+      for (var k = 0; k < headers.length; k++) row.push(wash);
+      return row;
     });
+    sh.getRange(3, 1, bg.length, headers.length).setBackgrounds(bg);
 
     tableStyle_(sh, 2, 1, out.length + 1, headers.length);
   } else {
