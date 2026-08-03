@@ -236,7 +236,13 @@ function fetchBase_(range, portfolios) {
       (withStatusReasons ? ' campaign.primary_status_reasons, ' : '') +
       ' metrics.cost_micros, metrics.conversions_value, metrics.conversions ' +
       'FROM campaign ' +
+      // Scope: currently-enabled campaigns only (paused/removed never
+      // appear), and only those with actual spend inside the 60-day base
+      // window - zero-spend campaigns would otherwise come back with
+      // all-zero metric rows and clutter every tab. The shorter-window and
+      // weekly pulls join onto this base by ID, so they inherit the scope.
       "WHERE campaign.status = 'ENABLED' " +
+      ' AND metrics.cost_micros > 0 ' +
       " AND segments.date BETWEEN '" + range.start + "' AND '" + range.end + "'";
   }
 
@@ -673,6 +679,8 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
       'campaigns. Charts are created once and then left alone on re-runs (data refreshes ' +
       'underneath), so manual styling in the chart editor sticks; delete a chart to have ' +
       'the script rebuild it.',
+    'Scope: only campaigns that are currently enabled AND spent in the last 60 days are ' +
+      'included. Paused, removed and zero-spend campaigns are ignored entirely.',
     'Decay on low-spend campaigns (< ' + CONFIG.LOW_SPEND_FLOOR + ' ' + currency +
       ' over 60d) is volatile — shown for context, never flagged for action. All rollups are ' +
       'cost-weighted. The data cannot see: attribution lag, intended campaign role, whether a ' +
