@@ -16,8 +16,9 @@ user's Google account.
 
 Both are functionally identical to the public `gads_scripts` versions - the
 difference is the branding: charts, header bands, highlight washes and accent
-colours use the Hola Studio palette (navy `#0D2952`, blue `#1B72BE`, light
-blue washes, light greys).
+colours use the Hola Studio palette (light blue `#38E3F2`, navy `#292B41`,
+light blue washes, light greys). Chart/filter helper data lives on a hidden
+"Audit Data (auto)" tab so the Summary tab stays clean.
 
 ### `bid-strategy-audit.js` (single account)
 

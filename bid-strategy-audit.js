@@ -2,7 +2,7 @@
  * BID STRATEGY AUDIT — pre-17-Aug-2026 target-based-bidding change.
  *
  * Author: Camilo - Hola Studio | holastudio.com.au
- * Hola Studio branded edition (navy #0D2952 / blue #1B72BE).
+ * Hola Studio branded edition (light blue #38E3F2 / navy #292B41).
  * *
  * READ-ONLY: this script makes NO changes to the Google Ads account. It only
  * reads reporting data (AdsApp.report queries and account metadata) and
@@ -68,9 +68,9 @@ var CONFIG = {
 
 // Theme.
 var COLORS = {
-  PRIMARY: '#1B72BE', // Hola Studio blue - header bands, primary series, "with target"
-  DARK: '#0D2952',    // Hola Studio navy - comparison series, "no target"
-  NAVY: '#0D2952',    // titles
+  PRIMARY: '#38E3F2', // Hola Studio light blue - header bands, primary series, "with target"
+  DARK: '#292B41',    // Hola Studio navy - comparison series, "no target", titles
+  NAVY: '#292B41',    // titles
   YELLOW: '#F4B400',  // gap-vs-target series (contrast against blue/navy)
   BORDER: '#D9D9D9',  // light grey table borders
   WHITE: '#FFFFFF',
@@ -81,6 +81,11 @@ var COLORS = {
 };
 
 var TAB_ORDER = ['Summary', 'Actionable', 'Campaign Data'];
+
+// Hidden tab holding all chart/filter source data. Charts keep reading a
+// hidden SHEET fine; hiding rows/columns on a visible sheet would drop
+// them from the charts, so a separate hidden tab is the only safe home.
+var DATA_TAB = 'Audit Data (auto)';
 
 // ---------------------------------------------------------------------------
 // ENTRY POINT
@@ -507,13 +512,17 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
             ranges.base.end + ' | Primary metric: ' + primaryMetric +
             ' | All money in ' + currency);
 
-  // ---- Helper tables the pie charts reference (kept far right, visible). ----
+  // ---- All chart/filter source data lives on the hidden data tab (see
+  // DATA_TAB). Layout there: A:B pie tables, D:I weekly chart table,
+  // K:P raw weekly rows, B14 the filter criteria cell. ----
+  var data = resetSheet_(ss, DATA_TAB);
+  data.getRange(1, 1).setValue('Auto-generated chart/filter data - do not edit')
+      .setFontStyle('italic').setFontColor('#999999');
+
   var withT = list.filter(function(c) { return c.hasTarget; });
   var noT = list.filter(function(c) { return !c.hasTarget; });
   function sum(arr, f) { var t = 0; arr.forEach(function(c) { t += f(c); }); return t; }
 
-  sh.getRange(3, 14).setValue('Chart data - do not edit').setFontStyle('italic')
-      .setFontColor('#999999');
   var helper = [
     ['Segment', 'Campaigns'],
     ['With target', withT.length],
@@ -527,13 +536,13 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
     ['With target', round2_(sum(withT, function(c) { return c.base.conv; }))],
     ['No target', round2_(sum(noT, function(c) { return c.base.conv; }))]
   ];
-  sh.getRange(4, 14, helper.length, 2).setValues(helper);
+  data.getRange(2, 1, helper.length, 2).setValues(helper);
 
   // Three native pie charts: with-target vs no-target split by campaign
   // count, 60d cost, 60d conversions.
   insertChartSafe_(sh, 'Campaigns: with vs without target', function() {
     return sh.newChart().setChartType(Charts.ChartType.PIE)
-        .addRange(sh.getRange(4, 14, 3, 2))
+        .addRange(data.getRange(2, 1, 3, 2))
         .setPosition(4, 1, 0, 0)
         .setOption('title', 'Campaigns: with vs without target')
         // Without setNumHeaders the header row is treated as a slice, which
@@ -550,7 +559,7 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
   });
   insertChartSafe_(sh, 'Cost 60d: with vs without target', function() {
     return sh.newChart().setChartType(Charts.ChartType.PIE)
-        .addRange(sh.getRange(8, 14, 3, 2))
+        .addRange(data.getRange(6, 1, 3, 2))
         .setPosition(4, 4, 0, 0)
         .setOption('title', 'Cost 60d: with vs without target')
         // Without setNumHeaders the header row is treated as a slice, which
@@ -567,7 +576,7 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
   });
   insertChartSafe_(sh, 'Conversions 60d: with vs without target', function() {
     return sh.newChart().setChartType(Charts.ChartType.PIE)
-        .addRange(sh.getRange(12, 14, 3, 2))
+        .addRange(data.getRange(10, 1, 3, 2))
         .setPosition(4, 7, 0, 0)
         .setOption('title', 'Conversions 60d: with vs without target')
         // Without setNumHeaders the header row is treated as a slice, which
@@ -585,7 +594,11 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
 
   // ---- Weekly target-vs-actual section (interactive, formula-driven). ----
   // Ends around row 34; the campaign table starts below it.
-  buildWeeklySection_(sh, primaryMetric, currency, weekly);
+  buildWeeklySection_(sh, data, primaryMetric, currency, weekly);
+
+  // Everything the charts and formulas read is on the data tab - hide it so
+  // the Summary tab stays clean. Formulas and charts keep working.
+  data.hideSheet();
 
   // ---- Full campaign table below the charts. ----
   var hdrRow = 36;
@@ -619,7 +632,7 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
       if (!c.actionable) return;
       var urgent = c.priority === '1 - Act now';
       sh.getRange(hdrRow + 1 + i, 1, 1, headers.length)
-          .setBackground(urgent ? '#CCE0F5' : '#E3EEF9');
+          .setBackground(urgent ? '#B9F5FC' : '#E0FBFE');
     });
 
     // "Conditional formatting" applied deterministically per row: red/amber/
@@ -688,20 +701,21 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
 /**
  * Weekly target-vs-actual chart with a live campaign filter, kept on Summary.
  *
- * The script writes RAW per-campaign per-week rows to a helper area and
- * builds the chart's 4-column source table out of SUMIFS formulas that read
- * a dropdown cell — so the chart re-filters inside the sheet, no script
- * re-run needed:
+ * All source data - raw per-campaign weekly rows and the SUMIFS/TREND table
+ * the chart reads - lives on the hidden DATA_TAB. Only the dropdown (B18),
+ * the est-decay figure (H18) and the chart itself stay on Summary:
  *   - dropdown B18: "All targeted campaigns" or any single targeted campaign;
  *   - Target line = cost-weighted stated target per week (sum(target*cost) /
- *     sum(cost) over the filtered rows);
+ *     sum(cost) over the filtered raw rows);
  *   - Actual line = the metric recomputed per week from filtered raw sums;
- *   - Decay trend line = in-sheet linear fit (TREND) over the weekly actuals,
- *     recomputed live as the filter changes; the estimated decay per week
- *     next to the dropdown is SLOPE/AVERAGE, sign-flipped for CPA so that
- *     negative always means deteriorating.
+ *   - Gap vs target = weekly % gap, same direction convention as the tabs;
+ *   - Decay trend line = in-sheet linear fit (TREND) over weekly actuals,
+ *     recomputed live as the filter changes; est. decay per week is
+ *     SLOPE/AVERAGE, sign-flipped for CPA so negative = deteriorating.
+ * Everything is formula-driven, so changing the dropdown re-filters the
+ * chart with no script re-run.
  */
-function buildWeeklySection_(sh, primaryMetric, currency, weekly) {
+function buildWeeklySection_(sh, data, primaryMetric, currency, weekly) {
   title_(sh, 16, 'Targeted campaigns - weekly ' + primaryMetric +
          ': target vs actual (last 8 weeks)', 11);
 
@@ -712,24 +726,23 @@ function buildWeeklySection_(sh, primaryMetric, currency, weekly) {
     return;
   }
 
-  // --- Raw helper rows (col S..X): Week | Campaign | Cost | Value | Conv |
-  // Target*Cost (pre-multiplied so the weighted target is a plain SUMIFS
-  // ratio). ---
-  var RAW_COL = 19; // S
-  sh.getRange(16, RAW_COL).setValue('Chart data - do not edit')
-      .setFontStyle('italic').setFontColor('#999999');
-  sh.getRange(17, RAW_COL, 1, 6).setValues(
+  // --- Raw helper rows on the data tab (K..P): Week | Campaign | Cost |
+  // Value | Conv | Target*Cost (pre-multiplied so the weighted target is a
+  // plain SUMIFS ratio). ---
+  data.getRange(2, 11, 1, 6).setValues(
       [['Week', 'Campaign', 'Cost', 'Value', 'Conv', 'TargetXCost']]);
   var rawOut = raw.map(function(x) {
     return [x.week, x.name, x.cost, x.value, x.conv, x.target * x.cost];
   });
-  sh.getRange(18, RAW_COL, rawOut.length, 6).setValues(rawOut);
-  var rawA1 = function(colLetter) {
-    return '$' + colLetter + '$18:$' + colLetter + '$' + (17 + rawOut.length);
+  data.getRange(3, 11, rawOut.length, 6).setValues(rawOut);
+  var rawEnd = 2 + rawOut.length;
+  var rawCol = function(colLetter) {
+    return '$' + colLetter + '$3:$' + colLetter + '$' + rawEnd;
   };
 
-  // --- Filter dropdown + criteria cell. SUMIFS criteria "<>" matches every
-  // non-blank campaign, which is how "All targeted campaigns" works. ---
+  // --- Filter dropdown on Summary; the criteria cell on the data tab reads
+  // it. SUMIFS criteria "<>" matches every non-blank campaign, which is how
+  // "All targeted campaigns" works. ---
   var names = {};
   raw.forEach(function(x) { names[x.name] = true; });
   var options = ['All targeted campaigns'].concat(Object.keys(names).sort());
@@ -737,71 +750,65 @@ function buildWeeklySection_(sh, primaryMetric, currency, weekly) {
   var dd = sh.getRange(18, 2, 1, 2).merge();
   dd.setDataValidation(SpreadsheetApp.newDataValidation()
       .requireValueInList(options, true).setAllowInvalid(false).build());
-  dd.setValue(options[0]).setBackground('#E3EEF9');
-  sh.getRange(17, 17).setFormula(  // Q17, hidden-in-plain-sight criteria
-      '=IF($B$18="All targeted campaigns","<>",$B$18)')
-      .setFontColor('#999999').setFontSize(8);
+  dd.setValue(options[0]).setBackground('#E0FBFE');
+  data.getRange(14, 1).setValue('Filter criteria:');
+  data.getRange(14, 2).setFormula(
+      '=IF(Summary!$B$18="All targeted campaigns","<>",Summary!$B$18)');
 
-  // --- Chart source table (col M..R): wk# | Week | Target | Actual |
-  // Gap vs target | Decay trend. The wk# column exists because Sheets does
-  // not reliably expand ROW(range) into an array inside SLOPE/TREND — a real
-  // index column makes the regression formulas dependable. ---
-  var IDX_COL = 13; // M
-  var TBL_COL = 14; // N
-  var tblStart = 19;
-  sh.getRange(18, IDX_COL, 1, 6).setValues(
+  // --- Chart source table on the data tab (D..I): wk# | Week | Target |
+  // Actual | Gap vs target | Decay trend. The wk# column exists because
+  // Sheets does not reliably expand ROW(range) into an array inside
+  // SLOPE/TREND - a real index column makes the regressions dependable. ---
+  data.getRange(2, 4, 1, 6).setValues(
       [['wk#', 'Week', 'Target', 'Actual', 'Gap vs target', 'Decay trend']]);
-  var crit = ',' + rawA1('T') + ',$Q$17';
+  var tblStart = 3;
   var lastRow = tblStart + weeks.length - 1;
-  var yA1 = '$P$' + tblStart + ':$P$' + lastRow;   // Actual column
-  var xA1 = '$M$' + tblStart + ':$M$' + lastRow;   // wk# column
+  var yA1 = '$G$' + tblStart + ':$G$' + lastRow;   // Actual column
+  var xA1 = '$D$' + tblStart + ':$D$' + lastRow;   // wk# column
+  var crit = ',' + rawCol('L') + ',$B$14';
   weeks.forEach(function(w, i) {
     var row = tblStart + i;
-    var wk = ',' + rawA1('S') + ',$N' + row;
-    sh.getRange(row, IDX_COL).setValue(i + 1);
-    sh.getRange(row, TBL_COL).setValue(w);
-    sh.getRange(row, TBL_COL + 1).setFormula(
-        '=IFERROR(SUMIFS(' + rawA1('X') + wk + crit + ')/SUMIFS(' +
-        rawA1('U') + wk + crit + '),"")');
-    sh.getRange(row, TBL_COL + 2).setFormula(primaryMetric === 'ROAS'
-        ? '=IFERROR(SUMIFS(' + rawA1('V') + wk + crit + ')/SUMIFS(' +
-          rawA1('U') + wk + crit + '),"")'
-        : '=IFERROR(SUMIFS(' + rawA1('U') + wk + crit + ')/SUMIFS(' +
-          rawA1('W') + wk + crit + '),"")');
+    var wk = ',' + rawCol('K') + ',$E' + row;
+    data.getRange(row, 4).setValue(i + 1);
+    data.getRange(row, 5).setValue(w);
+    data.getRange(row, 6).setFormula(
+        '=IFERROR(SUMIFS(' + rawCol('P') + wk + crit + ')/SUMIFS(' +
+        rawCol('M') + wk + crit + '),"")');
+    data.getRange(row, 7).setFormula(primaryMetric === 'ROAS'
+        ? '=IFERROR(SUMIFS(' + rawCol('N') + wk + crit + ')/SUMIFS(' +
+          rawCol('M') + wk + crit + '),"")'
+        : '=IFERROR(SUMIFS(' + rawCol('M') + wk + crit + ')/SUMIFS(' +
+          rawCol('O') + wk + crit + '),"")');
     // Gap vs target, same direction convention as every other tab: beating
     // the target reads positive for both ROAS and CPA.
-    sh.getRange(row, TBL_COL + 3).setFormula(primaryMetric === 'ROAS'
-        ? '=IFERROR(($P' + row + '-$O' + row + ')/$O' + row + ',"")'
-        : '=IFERROR(($O' + row + '-$P' + row + ')/$O' + row + ',"")');
-    sh.getRange(row, TBL_COL + 4).setFormula(
-        '=IFERROR(TREND(' + yA1 + ',' + xA1 + ',$M' + row + '),"")');
+    data.getRange(row, 8).setFormula(primaryMetric === 'ROAS'
+        ? '=IFERROR(($G' + row + '-$F' + row + ')/$F' + row + ',"")'
+        : '=IFERROR(($F' + row + '-$G' + row + ')/$F' + row + ',"")');
+    data.getRange(row, 9).setFormula(
+        '=IFERROR(TREND(' + yA1 + ',' + xA1 + ',$D' + row + '),"")');
   });
-  sh.getRange(tblStart, IDX_COL, weeks.length, 1)
-      .setFontColor('#999999').setFontSize(8);
-  sh.getRange(tblStart, TBL_COL + 1, weeks.length, 2)
-      .setNumberFormat('#,##0.00');
-  sh.getRange(tblStart, TBL_COL + 3, weeks.length, 1).setNumberFormat('0.0%');
-  sh.getRange(tblStart, TBL_COL + 4, weeks.length, 1)
-      .setNumberFormat('#,##0.00');
-  tableStyle_(sh, 18, IDX_COL, weeks.length + 1, 6);
+  data.getRange(tblStart, 6, weeks.length, 2).setNumberFormat('#,##0.00');
+  data.getRange(tblStart, 8, weeks.length, 1).setNumberFormat('0.0%');
+  data.getRange(tblStart, 9, weeks.length, 1).setNumberFormat('#,##0.00');
 
-  // Estimated decay per week, live with the filter. CPA slope is inverted so
-  // negative always reads "deteriorating".
+  // Estimated decay per week on Summary, live with the filter. CPA slope is
+  // inverted so negative always reads "deteriorating".
+  var ref = "'" + DATA_TAB + "'!";
   sh.getRange(18, 5, 1, 3).merge()
       .setValue('Est. decay per week (negative = deteriorating):')
       .setFontWeight('bold').setHorizontalAlignment('right');
   sh.getRange(18, 8).setFormula(
-      '=IFERROR(' + (primaryMetric === 'CPA' ? '-' : '') + 'SLOPE(' + yA1 +
-      ',' + xA1 + ')/AVERAGE(' + yA1 + '),"")')
+      '=IFERROR(' + (primaryMetric === 'CPA' ? '-' : '') + 'SLOPE(' + ref +
+      yA1 + ',' + ref + xA1 + ')/AVERAGE(' + ref + yA1 + '),"")')
       .setNumberFormat('0.0%').setFontWeight('bold')
-      .setFontColor(COLORS.PRIMARY).setBackground('#E3EEF9');
+      .setFontColor(COLORS.DARK).setBackground('#E0FBFE');
 
   var chartTitle = 'Weekly ' + primaryMetric +
       ' vs stated target - use the Campaign filter to drill in';
   insertChartSafe_(sh, chartTitle, function() {
     return sh.newChart().setChartType(Charts.ChartType.LINE)
-        .addRange(sh.getRange(18, TBL_COL, weeks.length + 1, 1))
-        .addRange(sh.getRange(18, TBL_COL + 1, weeks.length + 1, 4))
+        .addRange(data.getRange(2, 5, weeks.length + 1, 1))
+        .addRange(data.getRange(2, 6, weeks.length + 1, 4))
         // Without this the header row is charted as data and the legend
         // shows unnamed swatches.
         .setNumHeaders(1)
@@ -812,7 +819,7 @@ function buildWeeklySection_(sh, primaryMetric, currency, weekly) {
         .setOption('series', {
           0: { color: COLORS.DARK },                          // Target
           1: { color: COLORS.PRIMARY },                           // Actual
-          // Gap % lives on the right-hand axis — it's a ratio, not a
+          // Gap % lives on the right-hand axis - it's a ratio, not a
           // ROAS/CPA level, so it can't share the left axis scale.
           2: { color: COLORS.YELLOW, targetAxisIndex: 1 },
           3: { color: '#9E9E9E', lineDashStyle: [2, 4] }       // Decay trend (dotted)
@@ -962,7 +969,7 @@ function buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost) {
       if (!c.actionable) return;
       var urgent = c.priority === '1 - Act now';
       sh.getRange(3 + i, 1, 1, headers.length)
-          .setBackground(urgent ? '#CCE0F5' : '#E3EEF9');
+          .setBackground(urgent ? '#B9F5FC' : '#E0FBFE');
     });
 
     tableStyle_(sh, 2, 1, out.length + 1, headers.length);
@@ -1032,7 +1039,7 @@ function subtitle_(sh, row, text) {
 
 function headerBand_(sh, row, ncols) {
   sh.getRange(row, 1, 1, ncols).setBackground(COLORS.PRIMARY)
-      .setFontColor(COLORS.WHITE).setFontWeight('bold');
+      .setFontColor(COLORS.DARK).setFontWeight('bold');
 }
 
 // Shared table finish: light grey borders all round + vertical centring, so
