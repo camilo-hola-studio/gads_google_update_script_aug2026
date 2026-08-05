@@ -14,9 +14,10 @@
  * complete behaviour and can be audited.)
  *
  * Runs the pre-17-Aug-2026 bid strategy audit across every account under a
- * manager (MCC) account: each child account gets its own three-tab audit
- * spreadsheet (Summary / Actionable / Campaign Data), and the MCC gets an
- * Overview spreadsheet ranking accounts by urgency with a link to each audit.
+ * manager (MCC) account: each child account gets its own four-tab audit
+ * spreadsheet (Summary / Actionable / Change Impact / Campaign Data), and
+ * the MCC gets an Overview spreadsheet ranking accounts by urgency with a
+ * link to each audit.
  *
  * THE CHANGE (https://support.google.com/google-ads/answer/17061251): from
  * 17 August 2026, budget-limited campaigns using Target CPA / Target ROAS
@@ -80,7 +81,12 @@ var CONFIG = {
   BASE_WINDOW: 60,
 
   // Fallback budget-limited derivation threshold (see isBudgetLimited_).
-  BUDGET_LIMITED_THRESHOLD: 0.85
+  BUDGET_LIMITED_THRESHOLD: 0.85,
+
+  // Change Impact tab lookback in days (daily chart + change table). Capped
+  // at 29 in-code: the Google Ads change log (change_event) only retains 30
+  // days. The tab's weekly chart always covers the last 8 weeks.
+  CHANGE_LOOKBACK_DAYS: 28
 };
 
 // Theme.
@@ -97,7 +103,7 @@ var COLORS = {
   GREY: '#EFEFEF'     // no-target / low-spend rows
 };
 
-var TAB_ORDER = ['Summary', 'Actionable', 'Campaign Data'];
+var TAB_ORDER = ['Summary', 'Actionable', 'Change Impact', 'Campaign Data'];
 
 // ---------------------------------------------------------------------------
 // MCC ORCHESTRATION
@@ -316,10 +322,35 @@ function runAudit_() {
     Logger.log('Weekly series skipped: ' + e);
   }
 
+  // Change Impact inputs: daily series over the change window, all-campaign
+  // weekly series, and the budget/bid-strategy change history. Each guarded
+  // so a failure costs that piece of the tab, never the run.
+  var daily = { start: '', end: '', dates: [], rows: [] };
+  try {
+    daily = fetchDailyRows_(ranges.base.end, campaigns, changeWindowDays_());
+  } catch (e) {
+    Logger.log('Daily series skipped: ' + e);
+  }
+  var weeklyAll = { weeks: [], rows: [] };
+  try {
+    weeklyAll = fetchAllWeeklyRows_(ranges.base.end, campaigns);
+  } catch (e) {
+    Logger.log('All-campaign weekly series skipped: ' + e);
+  }
+  var changes = [], changesError = '';
+  try {
+    changes = fetchChangeEvents_(tz, campaigns, portfolios);
+  } catch (e) {
+    changesError = String(e);
+    Logger.log('Change history skipped: ' + e);
+  }
+
   var ss = openOrCreateAccountSheet_(account);
 
   buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency, weekly);
   buildActionableTab_(ss, list, primaryMetric, currency);
+  buildChangeImpactTab_(ss, list, primaryMetric, currency, daily, weeklyAll,
+                        changes, changesError);
   buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost);
 
   orderTabs_(ss);
@@ -588,6 +619,227 @@ function fetchWeeklyRows_(endIso, campaigns, primaryMetric) {
   var keep = {};
   weeks.forEach(function(w) { keep[w] = true; });
   return { weeks: weeks, rows: raw.filter(function(x) { return keep[x.week]; }) };
+}
+
+// Per-campaign per-day raw metrics over the change window, for the Change
+// Impact tab's daily chart and the before/after maths on each change. Joins
+// onto the 60d base by ID, so scope (enabled + spent) is inherited.
+function fetchDailyRows_(endIso, campaigns, days) {
+  var start = shiftDays_(endIso, -(days - 1));
+  var report = AdsApp.report(
+    'SELECT campaign.id, segments.date, metrics.cost_micros, ' +
+    ' metrics.conversions_value, metrics.conversions ' +
+    'FROM campaign ' +
+    "WHERE campaign.status = 'ENABLED' " +
+    " AND segments.date BETWEEN '" + start + "' AND '" + endIso + "'").rows();
+  var rows = [];
+  while (report.hasNext()) {
+    var r = report.next();
+    var c = campaigns[String(r['campaign.id'])];
+    if (!c) continue;
+    rows.push({
+      date: String(r['segments.date']),
+      id: c.id,
+      name: c.name,
+      cost: micros_(r['metrics.cost_micros']),
+      value: num_(r['metrics.conversions_value']),
+      conv: num_(r['metrics.conversions']),
+      target: c.target || 0
+    });
+  }
+  var dates = [];
+  for (var i = 0; i < days; i++) dates.push(shiftDays_(start, i));
+  return { start: start, end: endIso, dates: dates, rows: rows };
+}
+
+// Weekly raw rows for the Change Impact weekly chart. Same shape as
+// fetchWeeklyRows_ but covers ALL base campaigns (targeted or not, either
+// metric), so budget changes on untargeted campaigns are visible too;
+// campaigns without a target contribute no weight to the target line.
+function fetchAllWeeklyRows_(endIso, campaigns) {
+  var start = shiftDays_(endIso, -55);
+  var report = AdsApp.report(
+    'SELECT campaign.id, segments.week, metrics.cost_micros, ' +
+    ' metrics.conversions_value, metrics.conversions ' +
+    'FROM campaign ' +
+    "WHERE campaign.status = 'ENABLED' " +
+    " AND segments.date BETWEEN '" + start + "' AND '" + endIso + "'").rows();
+  var raw = [];
+  while (report.hasNext()) {
+    var r = report.next();
+    var c = campaigns[String(r['campaign.id'])];
+    if (!c) continue;
+    raw.push({
+      week: String(r['segments.week']),
+      name: c.name,
+      cost: micros_(r['metrics.cost_micros']),
+      value: num_(r['metrics.conversions_value']),
+      conv: num_(r['metrics.conversions']),
+      target: c.target || 0
+    });
+  }
+  var weekSet = {};
+  raw.forEach(function(x) { weekSet[x.week] = true; });
+  var weeks = Object.keys(weekSet).sort().slice(-8);
+  var keep = {};
+  weeks.forEach(function(w) { keep[w] = true; });
+  return { weeks: weeks, rows: raw.filter(function(x) { return keep[x.week]; }) };
+}
+
+// Budget & bid-strategy change history from the account's own change log
+// (change_event). The resource only retains 30 days and requires an explicit
+// datetime range plus a LIMIT, so the window is capped at 29 days ending
+// today - today's changes surface immediately even though metrics run to
+// yesterday. Only UPDATE operations on campaigns, campaign budgets and
+// portfolio bidding strategies are pulled; each event is parsed down to the
+// budget/bidding deltas the audit cares about (name edits etc. are dropped).
+function fetchChangeEvents_(tz, campaigns, portfolios) {
+  var today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  var start = shiftDays_(today, -changeWindowDays_());
+
+  function query(withAttribution) {
+    return 'SELECT change_event.change_date_time, ' +
+      ' change_event.change_resource_type, change_event.change_resource_name, ' +
+      ' change_event.changed_fields, change_event.old_resource, ' +
+      ' change_event.new_resource, change_event.resource_change_operation' +
+      (withAttribution
+        ? ', change_event.user_email, campaign.id, campaign.name ' : ' ') +
+      'FROM change_event ' +
+      "WHERE change_event.change_date_time >= '" + start + " 00:00:00' " +
+      " AND change_event.change_date_time <= '" + today + " 23:59:59' " +
+      " AND change_event.resource_change_operation = 'UPDATE' " +
+      " AND change_event.change_resource_type IN ('CAMPAIGN', " +
+      "  'CAMPAIGN_BUDGET', 'BIDDING_STRATEGY') " +
+      'ORDER BY change_event.change_date_time DESC ' +
+      'LIMIT 9800';
+  }
+
+  // The campaign attribution join and user_email are the fields most likely
+  // to be rejected by an older API version behind Scripts - retry without
+  // them (campaign is then recovered from the resource name where possible).
+  var rows;
+  try {
+    rows = AdsApp.report(query(true)).rows();
+    rows.hasNext(); // force validation now, not mid-parse
+  } catch (e) {
+    Logger.log('Change history attribution unavailable, retrying reduced ' +
+               'query: ' + e);
+    rows = AdsApp.report(query(false)).rows();
+  }
+
+  var out = [];
+  while (rows.hasNext()) {
+    var r = rows.next();
+    try {
+      var evs = parseChangeEvent_(r, campaigns, portfolios);
+      for (var i = 0; i < evs.length; i++) out.push(evs[i]);
+    } catch (e2) {
+      Logger.log('Skipping unreadable change event: ' + e2);
+    }
+  }
+  return out;
+}
+
+// One change_event row -> zero or more {date, time, campId, label, what,
+// old, nw, numeric, who} deltas, keeping only budget amounts and bidding
+// fields. old_resource/new_resource arrive as serialised proto JSON whose
+// key casing differs between runtimes - protoGet_ tries both.
+function parseChangeEvent_(r, campaigns, portfolios) {
+  var type = String(r['change_event.change_resource_type'] || '');
+  var fields = String(r['change_event.changed_fields'] || '')
+      .replace(/[\[\]"]/g, '').split(',').map(function(f) { return f.trim(); });
+  var oldRes = safeJson_(r['change_event.old_resource']);
+  var newRes = safeJson_(r['change_event.new_resource']);
+  var dt = String(r['change_event.change_date_time'] || '');
+  var resName = String(r['change_event.change_resource_name'] || '');
+
+  var campId = String(r['campaign.id'] || '');
+  if (!campId && type === 'CAMPAIGN') {
+    var m = resName.match(/campaigns\/(\d+)/);
+    if (m) campId = m[1];
+  }
+  var known = campaigns[campId];
+  var label = known ? known.name : String(r['campaign.name'] || '');
+
+  var deltas = [];
+  function pushNum(field, what, path, isMicros) {
+    if (fields.indexOf(field) === -1) return;
+    var o = parseFloat(protoGet_(oldRes, path));
+    var n = parseFloat(protoGet_(newRes, path));
+    o = isFinite(o) ? (isMicros ? o / 1e6 : o) : null;
+    n = isFinite(n) ? (isMicros ? n / 1e6 : n) : null;
+    if (o == null && n == null) return;
+    deltas.push({ what: what, old: o, nw: n, numeric: true });
+  }
+  function pushText(field, what, oldV, newV) {
+    if (fields.indexOf(field) === -1) return;
+    deltas.push({ what: what, old: oldV, nw: newV, numeric: false });
+  }
+
+  if (type === 'CAMPAIGN_BUDGET') {
+    pushNum('amount_micros', 'Daily budget',
+            ['campaign_budget', 'amount_micros'], true);
+    if (!label) label = '(shared or unattributed budget)';
+  } else if (type === 'CAMPAIGN') {
+    pushNum('target_roas.target_roas', 'Target ROAS',
+            ['campaign', 'target_roas', 'target_roas'], false);
+    pushNum('maximize_conversion_value.target_roas', 'Target ROAS',
+            ['campaign', 'maximize_conversion_value', 'target_roas'], false);
+    pushNum('target_cpa.target_cpa_micros', 'Target CPA',
+            ['campaign', 'target_cpa', 'target_cpa_micros'], true);
+    pushNum('maximize_conversions.target_cpa_micros', 'Target CPA',
+            ['campaign', 'maximize_conversions', 'target_cpa_micros'], true);
+    pushText('bidding_strategy_type', 'Bid strategy type',
+        prettyStrategyType_(String(
+            protoGet_(oldRes, ['campaign', 'bidding_strategy_type']) || '')),
+        prettyStrategyType_(String(
+            protoGet_(newRes, ['campaign', 'bidding_strategy_type']) || '')));
+    pushText('bidding_strategy', 'Portfolio strategy',
+        stratName_(protoGet_(oldRes, ['campaign', 'bidding_strategy']),
+                   portfolios),
+        stratName_(protoGet_(newRes, ['campaign', 'bidding_strategy']),
+                   portfolios));
+    pushText('campaign_budget', 'Budget assignment', '',
+             'campaign moved to a different budget');
+  } else if (type === 'BIDDING_STRATEGY') {
+    // Portfolio strategy: the change applies to every attached campaign at
+    // once, so it cannot be pinned on a single campaign's before/after.
+    var p = portfolios[resName];
+    label = 'Portfolio: ' + ((p && p.name) ||
+        String(protoGet_(newRes, ['bidding_strategy', 'name']) || '') ||
+        resName);
+    campId = '';
+    pushNum('target_roas.target_roas', 'Portfolio target ROAS',
+            ['bidding_strategy', 'target_roas', 'target_roas'], false);
+    pushNum('maximize_conversion_value.target_roas', 'Portfolio target ROAS',
+            ['bidding_strategy', 'maximize_conversion_value', 'target_roas'],
+            false);
+    pushNum('target_cpa.target_cpa_micros', 'Portfolio target CPA',
+            ['bidding_strategy', 'target_cpa', 'target_cpa_micros'], true);
+    pushNum('maximize_conversions.target_cpa_micros', 'Portfolio target CPA',
+            ['bidding_strategy', 'maximize_conversions', 'target_cpa_micros'],
+            true);
+    pushText('type', 'Portfolio strategy type',
+        prettyStrategyType_(String(
+            protoGet_(oldRes, ['bidding_strategy', 'type']) || '')),
+        prettyStrategyType_(String(
+            protoGet_(newRes, ['bidding_strategy', 'type']) || '')));
+  }
+  if (!label) label = '(unknown)';
+
+  return deltas.map(function(d) {
+    return {
+      date: dt.slice(0, 10),
+      time: dt.length >= 16 ? dt.slice(11, 16) : '',
+      campId: campId,
+      label: label,
+      what: d.what,
+      old: d.old == null ? '' : d.old,
+      nw: d.nw == null ? '' : d.nw,
+      numeric: d.numeric,
+      who: String(r['change_event.user_email'] || '')
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,7 +1394,374 @@ function actionCommentary_(c) {
 }
 
 // ---------------------------------------------------------------------------
-// TAB 3: CAMPAIGN DATA
+// TAB 3: CHANGE IMPACT
+// ---------------------------------------------------------------------------
+/**
+ * Budget & bid-strategy change history matched to performance, so a change
+ * made on any date is visible against what the metric did next - no more
+ * opening Change history in the UI and cross-referencing by hand.
+ *
+ * Two formula-driven charts (daily over the change window, weekly over the
+ * last 8 weeks) share one campaign dropdown, on the same live-SUMIFS pattern
+ * as the Summary weekly section: raw per-campaign rows sit camouflaged at
+ * the far right and the chart source tables recompute as the filter changes.
+ * Yellow dots pinned to the Actual line mark the days/weeks where at least
+ * one budget or bid strategy change hit the filtered campaign(s).
+ *
+ * The table lists every relevant change (newest first) with old -> new
+ * values plus spend and ROAS/CPA in the 7 days before vs after, and a
+ * direction-aware Impact % (positive = improved, for ROAS and CPA alike).
+ * The change log only reaches back 30 days, so nothing older ever appears -
+ * schedule the script weekly and the sheet becomes the rolling record.
+ *
+ * Helper zone geometry (headers row 2, data from row 3):
+ *   P1      filter criteria cell
+ *   Q..W    daily raw rows   (Date|Campaign|Cost|Value|Conv|TargetXCost|TCost)
+ *   Y..AE   weekly raw rows  (Week|Campaign|Cost|Value|Conv|TargetXCost|TCost)
+ *   AG..AI  change rows      (Date|Campaign|Week)
+ *   AK..AN  daily chart source  (Date|Target|Actual|Change)
+ *   AP..AS  weekly chart source (Week|Target|Actual|Change)
+ */
+function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
+                               weeklyAll, changes, changesError) {
+  var sh = resetSheet_(ss, 'Change Impact');
+
+  title_(sh, 1, 'Change Impact - budget & bid strategy changes vs performance',
+         12);
+  subtitle_(sh, 2, 'Charts: navy = current stated target (cost-weighted), ' +
+      'light blue = actual ' + primaryMetric + ', yellow dots = days/weeks ' +
+      'with a budget or bid strategy change for the filtered campaign(s). ' +
+      'Table: every change in the last ' + daily.dates.length + ' days ' +
+      '(Google Ads keeps only 30 days of change history) with performance ' +
+      '7 days before vs after. All money in ' + currency + '.');
+
+  if (!daily.rows.length) {
+    sh.getRange(4, 1).setValue('No daily performance data available for ' +
+        'this window - charts and change matching need spend to plot.')
+        .setFontColor('#666666');
+    finishSheet_(sh);
+    return;
+  }
+
+  // The daily raw block (campaigns x days) can outgrow a default 1000-row
+  // sheet on big accounts.
+  var needRows = Math.max(daily.rows.length + 2, weeklyAll.rows.length + 2,
+                          changes.length + 40, 120);
+  if (sh.getMaxRows() < needRows) {
+    sh.insertRowsAfter(sh.getMaxRows(), needRows - sh.getMaxRows());
+  }
+
+  // ---- Campaign filter dropdown driving both charts. ----
+  var names = {};
+  daily.rows.forEach(function(x) { names[x.name] = true; });
+  var options = ['All campaigns'].concat(Object.keys(names).sort());
+  sh.getRange(3, 1).setValue('Campaign filter:').setFontWeight('bold');
+  var dd = sh.getRange(3, 2, 1, 3).merge();
+  dd.setDataValidation(SpreadsheetApp.newDataValidation()
+      .requireValueInList(options, true).setAllowInvalid(false).build());
+  dd.setValue(options[0]).setBackground('#E0FBFE');
+  // P1: SUMIFS/COUNTIFS criteria - "<>" matches every non-blank campaign,
+  // which is how "All campaigns" works.
+  sh.getRange(1, 16).setFormula(
+      '=IF($B$3="All campaigns","<>",$B$3)');
+
+  // ---- Raw helper rows. ----
+  sh.getRange(2, 17, 1, 7).setValues(
+      [['Date', 'Campaign', 'Cost', 'Value', 'Conv', 'TargetXCost', 'TCost']]);
+  var dOut = daily.rows.map(function(x) {
+    return [x.date, x.name, x.cost, x.value, x.conv,
+            x.target * x.cost, x.target > 0 ? x.cost : 0];
+  });
+  sh.getRange(3, 17, dOut.length, 7).setValues(dOut);
+
+  sh.getRange(2, 25, 1, 7).setValues(
+      [['Week', 'Campaign', 'Cost', 'Value', 'Conv', 'TargetXCost', 'TCost']]);
+  if (weeklyAll.rows.length) {
+    var wOut = weeklyAll.rows.map(function(x) {
+      return [x.week, x.name, x.cost, x.value, x.conv,
+              x.target * x.cost, x.target > 0 ? x.cost : 0];
+    });
+    sh.getRange(3, 25, wOut.length, 7).setValues(wOut);
+  }
+
+  sh.getRange(2, 33, 1, 3).setValues([['Date', 'Campaign', 'Week']]);
+  if (changes.length) {
+    var cOut = changes.map(function(g) {
+      return [g.date, g.label, weekMondayOf_(g.date)];
+    });
+    sh.getRange(3, 33, cOut.length, 3).setValues(cOut);
+  }
+
+  var dEnd = 2 + dOut.length;
+  var wEnd = 2 + Math.max(weeklyAll.rows.length, 1);
+  var cEnd = 2 + Math.max(changes.length, 1);
+  function dR(col) { return '$' + col + '$3:$' + col + '$' + dEnd; }
+  function wR(col) { return '$' + col + '$3:$' + col + '$' + wEnd; }
+  function cR(col) { return '$' + col + '$3:$' + col + '$' + cEnd; }
+
+  // ---- Daily chart source (AK..AN). Target = weighted stated target over
+  // the filtered rows; Actual = the metric recomputed per day; Change =
+  // the Actual value only on days where the change log has an entry for
+  // the filtered campaign(s), so it plots as isolated dots on the line. ----
+  sh.getRange(2, 37, 1, 4).setValues([['Date', 'Target', 'Actual', 'Change']]);
+  var dDates = [], dFormulas = [];
+  daily.dates.forEach(function(d, i) {
+    var row = 3 + i;
+    var k = ',' + dR('Q') + ',$AK' + row + ',' + dR('R') + ',$P$1';
+    dDates.push([d]);
+    dFormulas.push([
+      '=IFERROR(SUMIFS(' + dR('V') + k + ')/SUMIFS(' + dR('W') + k + '),"")',
+      primaryMetric === 'ROAS'
+          ? '=IFERROR(SUMIFS(' + dR('T') + k + ')/SUMIFS(' + dR('S') + k +
+            '),"")'
+          : '=IFERROR(SUMIFS(' + dR('S') + k + ')/SUMIFS(' + dR('U') + k +
+            '),"")',
+      '=IF(AND($AM' + row + '<>"",COUNTIFS(' + cR('AG') + ',$AK' + row + ',' +
+          cR('AH') + ',$P$1)>0),$AM' + row + ',"")'
+    ]);
+  });
+  sh.getRange(3, 37, dDates.length, 1).setValues(dDates);
+  sh.getRange(3, 38, dFormulas.length, 3).setFormulas(dFormulas);
+  sh.getRange(3, 38, dDates.length, 3).setNumberFormat('#,##0.00');
+
+  // ---- Weekly chart source (AP..AS), same construction per week. ----
+  sh.getRange(2, 42, 1, 4).setValues([['Week', 'Target', 'Actual', 'Change']]);
+  var weeks = weeklyAll.weeks;
+  if (weeks.length) {
+    var wWeeks = [], wFormulas = [];
+    weeks.forEach(function(w, i) {
+      var row = 3 + i;
+      var k = ',' + wR('Y') + ',$AP' + row + ',' + wR('Z') + ',$P$1';
+      wWeeks.push([w]);
+      wFormulas.push([
+        '=IFERROR(SUMIFS(' + wR('AD') + k + ')/SUMIFS(' + wR('AE') + k +
+            '),"")',
+        primaryMetric === 'ROAS'
+            ? '=IFERROR(SUMIFS(' + wR('AB') + k + ')/SUMIFS(' + wR('AA') + k +
+              '),"")'
+            : '=IFERROR(SUMIFS(' + wR('AA') + k + ')/SUMIFS(' + wR('AC') + k +
+              '),"")',
+        '=IF(AND($AR' + row + '<>"",COUNTIFS(' + cR('AI') + ',$AP' + row +
+            ',' + cR('AH') + ',$P$1)>0),$AR' + row + ',"")'
+      ]);
+    });
+    sh.getRange(3, 42, wWeeks.length, 1).setValues(wWeeks);
+    sh.getRange(3, 43, wFormulas.length, 3).setFormulas(wFormulas);
+    sh.getRange(3, 43, wWeeks.length, 3).setNumberFormat('#,##0.00');
+  }
+
+  // ---- The two charts, side by side. ----
+  var dailyTitle = 'Daily ' + primaryMetric +
+      ' vs target - change days marked';
+  insertChartSafe_(sh, dailyTitle, function() {
+    return sh.newChart().setChartType(Charts.ChartType.LINE)
+        .addRange(sh.getRange(2, 37, daily.dates.length + 1, 4))
+        // Without this the header row is charted as data and the legend
+        // shows unnamed swatches.
+        .setNumHeaders(1)
+        .setPosition(5, 1, 0, 0)
+        .setOption('title', dailyTitle)
+        .setOption('colors', [COLORS.DARK, COLORS.PRIMARY, COLORS.YELLOW])
+        .setOption('series', {
+          0: { color: COLORS.DARK },                                // Target
+          1: { color: COLORS.PRIMARY },                             // Actual
+          // Change days as isolated dots pinned to the Actual line.
+          2: { color: COLORS.YELLOW, lineWidth: 0, pointSize: 8 }
+        })
+        .setOption('width', 640).setOption('height', 320)
+        .setOption('legend', { position: 'bottom' })
+        .build();
+  });
+  if (weeks.length) {
+    var weeklyTitle = 'Weekly ' + primaryMetric +
+        ' vs target - change weeks marked (last 8 weeks)';
+    insertChartSafe_(sh, weeklyTitle, function() {
+      return sh.newChart().setChartType(Charts.ChartType.LINE)
+          .addRange(sh.getRange(2, 42, weeks.length + 1, 4))
+          .setNumHeaders(1)
+          .setPosition(5, 7, 0, 0)
+          .setOption('title', weeklyTitle)
+          .setOption('colors', [COLORS.DARK, COLORS.PRIMARY, COLORS.YELLOW])
+          .setOption('series', {
+            0: { color: COLORS.DARK },
+            1: { color: COLORS.PRIMARY },
+            2: { color: COLORS.YELLOW, lineWidth: 0, pointSize: 8 }
+          })
+          .setOption('width', 640).setOption('height', 320)
+          .setOption('legend', { position: 'bottom' })
+          .build();
+    });
+  }
+
+  // ---- Change history table. ----
+  var TBL = 23;
+  title_(sh, TBL - 1, 'Change history - budgets & bid strategies, newest first',
+         11);
+  var headers = ['Date', 'Time', 'Campaign', 'Change', 'Old value',
+                 'New value', 'Change %', 'Cost/day 7d before',
+                 'Cost/day 7d after', 'Metric', '7d before', '7d after',
+                 'Impact', 'Changed by'];
+  sh.getRange(TBL, 1, 1, headers.length).setValues([headers]);
+  headerBand_(sh, TBL, headers.length);
+
+  var noteRow;
+  if (changesError) {
+    sh.getRange(TBL + 1, 1, 1, headers.length).merge()
+        .setValue('Change history unavailable this run: ' + changesError)
+        .setFontColor('#666666').setFontStyle('italic');
+    noteRow = TBL + 3;
+  } else if (!changes.length) {
+    sh.getRange(TBL + 1, 1, 1, headers.length).merge()
+        .setValue('No budget or bid strategy changes recorded in the last ' +
+                  daily.dates.length + ' days.')
+        .setFontColor('#666666').setFontStyle('italic');
+    noteRow = TBL + 3;
+  } else {
+    var byCamp = {};
+    daily.rows.forEach(function(x) {
+      (byCamp[x.id] = byCamp[x.id] || {})[x.date] = x;
+    });
+    var cmap = {};
+    list.forEach(function(c) { cmap[c.id] = c; });
+    function spanTotals(id, startIso, days) {
+      var t = { cost: 0, value: 0, conv: 0 };
+      for (var i = 0; i < days; i++) {
+        var x = (byCamp[id] || {})[shiftDays_(startIso, i)];
+        if (x) { t.cost += x.cost; t.value += x.value; t.conv += x.conv; }
+      }
+      return t;
+    }
+
+    var out = changes.map(function(g) {
+      var c = g.campId ? cmap[g.campId] : null;
+      var costB = '', costA = '', mB = '', mA = '', impact = '', mType = '';
+      if (c) {
+        mType = c.metricType;
+        // Before: the 7 days up to and excluding the change day, clipped to
+        // the data window; After: the 7 days from the day following the
+        // change, clipped to yesterday. ISO strings compare lexically.
+        var bStart = shiftDays_(g.date, -7);
+        if (bStart < daily.start) bStart = daily.start;
+        var bEnd = shiftDays_(g.date, -1);
+        var bDays = bEnd >= bStart ? daysBetween_(bStart, bEnd) + 1 : 0;
+        var aStart = shiftDays_(g.date, 1);
+        var aEnd = shiftDays_(g.date, 7);
+        if (aEnd > daily.end) aEnd = daily.end;
+        var aDays = aEnd >= aStart ? daysBetween_(aStart, aEnd) + 1 : 0;
+
+        if (bDays >= 3) {
+          var b = spanTotals(c.id, bStart, bDays);
+          costB = round2_(b.cost / bDays);
+          var mBv = metricOf_(b, mType);
+          if (mBv != null) mB = round2_(mBv);
+        }
+        if (aDays > 0) {
+          var a = spanTotals(c.id, aStart, aDays);
+          costA = round2_(a.cost / aDays);
+          if (aDays >= 3) {
+            var mAv = metricOf_(a, mType);
+            if (mAv != null) mA = round2_(mAv);
+          }
+        }
+        if (aDays < 3) {
+          impact = 'Too early (' + aDays + 'd after)';
+        } else if (mB !== '' && mB !== 0 && mA !== '') {
+          impact = mType === 'ROAS' ? (mA - mB) / mB : (mB - mA) / mB;
+        }
+      }
+      var pct = '';
+      if (g.numeric && typeof g.old === 'number' &&
+          typeof g.nw === 'number' && g.old > 0) {
+        pct = (g.nw - g.old) / g.old;
+      }
+      return [g.date, g.time, g.label, g.what,
+              g.numeric && g.old !== '' ? round2_(g.old) : g.old,
+              g.numeric && g.nw !== '' ? round2_(g.nw) : g.nw,
+              pct, costB, costA, mType, mB, mA, impact, g.who];
+    });
+    sh.getRange(TBL + 1, 1, out.length, headers.length).setValues(out);
+    sh.getRange(TBL + 1, 5, out.length, 2).setNumberFormat('#,##0.00');
+    sh.getRange(TBL + 1, 7, out.length, 1).setNumberFormat('0.0%');
+    sh.getRange(TBL + 1, 8, out.length, 2).setNumberFormat('#,##0.00');
+    sh.getRange(TBL + 1, 11, out.length, 2).setNumberFormat('#,##0.00');
+    sh.getRange(TBL + 1, 13, out.length, 1).setNumberFormat('0.0%');
+
+    // Impact cell wash: red = deteriorated >=10%, green = improved >=10%,
+    // grey = not yet measurable. One batched setBackgrounds call.
+    var bg = out.map(function(rowVals) {
+      var row = [];
+      for (var k = 0; k < headers.length; k++) row.push(null);
+      var imp = rowVals[12];
+      if (typeof imp === 'number') {
+        row[12] = imp <= -0.10 ? COLORS.RED
+                : imp >= 0.10 ? COLORS.GREEN : null;
+      } else if (imp) {
+        row[12] = COLORS.GREY;
+      }
+      return row;
+    });
+    sh.getRange(TBL + 1, 1, bg.length, headers.length).setBackgrounds(bg);
+    tableStyle_(sh, TBL, 1, out.length + 1, headers.length);
+    noteRow = TBL + out.length + 2;
+  }
+
+  var notes = [
+    'How to read this',
+    'Change history comes from the account\'s own change log (change_event) ' +
+      'and only reaches back 30 days - run the script weekly and this tab ' +
+      'becomes the rolling record of every budget and bid strategy move. ' +
+      'Today\'s changes appear immediately (metrics run to yesterday, so ' +
+      'their impact reads "Too early").',
+    'Impact is direction-aware: positive = improved (ROAS up, CPA down), ' +
+      'comparing the 7 days after the change (excluding the change day) to ' +
+      'the 7 days before. It needs at least 3 days of data each side; red ' +
+      '<= -10%, green >= +10%. The after-window also contains whatever else ' +
+      'happened that week - seasonality, promos, other changes - so read it ' +
+      'as "what happened next", not proof of cause.',
+    'Both charts recompute live from the Campaign filter dropdown - no ' +
+      'script re-run needed. The target line is the CURRENT stated target ' +
+      '(cost-weighted across filtered campaigns); past target changes show ' +
+      'as dots, not as steps in the line. Campaigns without a target plot ' +
+      'an actual line only.',
+    'To filter the TABLE by campaign use Data > Create a filter view (a ' +
+      'plain filter hides rows, which would blank the charts\' camouflaged ' +
+      'source data sitting on the same rows).',
+    'Portfolio strategy changes apply to every attached campaign at once, ' +
+      'so their before/after columns stay blank; changes to shared budgets ' +
+      'may not attribute to a single campaign either.'
+  ];
+  notes.forEach(function(n, i) {
+    var cell = sh.getRange(noteRow + i, 1, 1, headers.length);
+    cell.merge().setValue(n).setWrap(true).setFontSize(9)
+        .setVerticalAlignment('middle')
+        .setFontColor(i === 0 ? COLORS.NAVY : '#666666');
+    if (i === 0) cell.setFontWeight('bold');
+    else cell.setFontStyle('italic');
+  });
+
+  // Camouflage the helper zone (cols P..AS) - same arrangement as Summary:
+  // sources must stay on this sheet and unhidden, so they go white 6pt in
+  // pencil-thin columns instead.
+  sh.getRange(1, 16, Math.min(sh.getMaxRows(), Math.max(needRows, 1000)), 30)
+      .setFontColor('#FFFFFF').setFontSize(6);
+  sh.setColumnWidths(16, 30, 26);
+
+  sh.setColumnWidths(1, 1, 90);   // Date
+  sh.setColumnWidths(2, 1, 55);   // Time
+  sh.setColumnWidths(3, 1, 280);  // Campaign
+  sh.setColumnWidths(4, 1, 150);  // Change
+  sh.setColumnWidths(5, 2, 110);  // Old / New value
+  sh.setColumnWidths(7, 1, 85);   // Change %
+  sh.setColumnWidths(8, 2, 120);  // Cost/day before / after
+  sh.setColumnWidths(10, 1, 65);  // Metric
+  sh.setColumnWidths(11, 2, 90);  // 7d before / after
+  sh.setColumnWidths(13, 1, 85);  // Impact
+  sh.setColumnWidths(14, 1, 180); // Changed by
+  finishSheet_(sh);
+}
+
+// ---------------------------------------------------------------------------
+// TAB 4: CAMPAIGN DATA
 // ---------------------------------------------------------------------------
 function buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost) {
   var sh = resetSheet_(ss, 'Campaign Data');
@@ -1354,6 +1973,55 @@ function micros_(v) {
 
 function round2_(v) {
   return Math.round(v * 100) / 100;
+}
+
+// Change Impact window: capped at 29 days because the change log
+// (change_event) only retains 30 days of history.
+function changeWindowDays_() {
+  return Math.max(7, Math.min(CONFIG.CHANGE_LOOKBACK_DAYS || 28, 29));
+}
+
+// Monday of the week containing the date - matches segments.week bucketing,
+// so in-sheet change markers line up with the weekly rows.
+function weekMondayOf_(isoDate) {
+  var d = new Date(isoDate + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() - (d.getUTCDay() + 6) % 7);
+  return Utilities.formatDate(d, 'UTC', 'yyyy-MM-dd');
+}
+
+function daysBetween_(startIso, endIso) {
+  return Math.round((new Date(endIso + 'T12:00:00Z') -
+                     new Date(startIso + 'T12:00:00Z')) / 86400000);
+}
+
+function safeJson_(v) {
+  try {
+    var o = JSON.parse(String(v || ''));
+    return o && typeof o === 'object' ? o : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+// Walk a parsed proto by snake_case path, accepting camelCase keys too (the
+// serialisation of change_event old/new resources differs between runtimes).
+function protoGet_(obj, path) {
+  var cur = obj;
+  for (var i = 0; i < path.length; i++) {
+    if (cur == null || typeof cur !== 'object') return null;
+    var snake = path[i];
+    var camel = snake.replace(/_([a-z])/g,
+        function(mm, l) { return l.toUpperCase(); });
+    cur = cur[snake] != null ? cur[snake] : cur[camel];
+  }
+  return cur == null ? null : cur;
+}
+
+// Portfolio strategy resource name -> its display name where known.
+function stratName_(resourceName, portfolios) {
+  var s = String(resourceName || '');
+  if (!s) return '(none)';
+  return (portfolios[s] && portfolios[s].name) || s;
 }
 
 function prettyStrategyType_(t) {
