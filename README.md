@@ -24,19 +24,26 @@ the clean-looking arrangement that keeps the charts and live filter working.
 
 ### `bid-strategy-audit.js` (single account)
 
-Three-tab audit workbook per account: **Summary** (target-split pies, the
+Four-tab audit workbook per account: **Summary** (target-split pies, the
 interactive 8-week target-vs-actual chart with campaign filter and decay
 trend line, campaign table with 30/14/7d actuals), **Actionable** (one row
-per campaign whose target should move, timed before/after 17 Aug), and
-**Campaign Data** (all windows, actionable rows highlighted). Install in a
-single account: Tools > Bulk actions > Scripts, paste, authorise, run;
-leave `SPREADSHEET_URL` blank on first run, then pin the logged URL.
+per campaign whose target should move, timed before/after 17 Aug),
+**Change Impact** (daily and weekly target-vs-actual charts with yellow
+dots marking the days/weeks a budget or bid strategy change was made — both
+filterable by campaign — plus a change-history table from the account's own
+change log with old→new values and the 7-days-before vs 7-days-after
+ROAS/CPA impact of each change; the log only reaches back 30 days, so run
+weekly to keep a rolling record), and **Campaign Data** (all windows,
+actionable rows highlighted). Install in a single account: Tools > Bulk
+actions > Scripts, paste, authorise, run; leave `SPREADSHEET_URL` blank on
+first run, then pin the logged URL.
 
 ### `mcc-bid-strategy-audit.js` (manager level)
 
 Installs once at MCC level, audits up to 50 child accounts per run in
 parallel (batch bigger MCCs with `ACCOUNT_LABEL` / `ACCOUNT_IDS`), writes
-each account its own audit workbook plus an MCC **Overview** ranking
-accounts most-urgent-first with links to every audit. Run once with
+each account its own four-tab audit workbook (including the same Change
+Impact tab) plus an MCC **Overview** ranking accounts most-urgent-first
+with links to every audit. Run once with
 `MASTER_SPREADSHEET_URL` blank, then paste the logged Overview URL into the
 config so re-runs reuse the same sheets. `LOW_SPEND_FLOOR` defaults to 0.
