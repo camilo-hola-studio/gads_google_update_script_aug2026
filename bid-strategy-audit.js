@@ -66,10 +66,18 @@ var CONFIG = {
   // spend reaches this share of its daily budget (see isBudgetLimited_).
   BUDGET_LIMITED_THRESHOLD: 0.85,
 
-  // Change Impact tab lookback in days (daily chart + change table). Capped
-  // at 29 in-code: the Google Ads change log (change_event) only retains 30
-  // days. The tab's weekly chart always covers the last 8 weeks.
-  CHANGE_LOOKBACK_DAYS: 28
+  // Change Impact tab lookback in days (daily chart + fresh change pulls).
+  // Capped at 29 in-code: the Google Ads change log (change_event) only
+  // retains 30 days. Changes already pulled are archived inside the sheet,
+  // so the table keeps accumulating across runs regardless of this cap.
+  CHANGE_LOOKBACK_DAYS: 28,
+
+  // Campaigns whose 60-day cost is below this (account currency) are dropped
+  // from the workbook entirely - every tab, chart and dropdown. Old test /
+  // video campaigns trickling a few dollars a week otherwise clutter every
+  // view. Set to 0 to include every campaign with any spend. (Different from
+  // LOW_SPEND_FLOOR, which only controls flagging, not inclusion.)
+  MIN_COST_60D: 100
 };
 
 // Theme.
@@ -107,6 +115,13 @@ function main() {
 
   // 60-day base pull: identity, strategy, targets, budget + 60d metrics.
   var campaigns = fetchBase_(ranges.base, portfolios);
+
+  // Hard exclusion below MIN_COST_60D: the campaign disappears from every
+  // tab, chart, dropdown and change row - not just from flagging. Every
+  // downstream pull joins onto this map, so the scope is inherited.
+  for (var cid in campaigns) {
+    if (campaigns[cid].base.cost < CONFIG.MIN_COST_60D) delete campaigns[cid];
+  }
 
   // -------------------------------------------------------------------------
   // THE CORE JOIN. There is no native 30/14/7-day ROAS or CPA column and the
@@ -176,6 +191,8 @@ function main() {
   }
 
   var ss = openOrCreateSpreadsheet_(account, ranges);
+  applySheetName_(ss, account.getName() || account.getCustomerId(),
+                  'Bid Strategy Audit');
 
   buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency, weekly);
   buildActionableTab_(ss, list, primaryMetric, currency);
@@ -527,7 +544,12 @@ function fetchChangeEvents_(tz, campaigns, portfolios) {
     var r = rows.next();
     try {
       var evs = parseChangeEvent_(r, campaigns, portfolios);
-      for (var i = 0; i < evs.length; i++) out.push(evs[i]);
+      for (var i = 0; i < evs.length; i++) {
+        // Changes on campaigns excluded from the report (no 60d spend, or
+        // below MIN_COST_60D) would dangle - skip them.
+        if (evs[i].campId && !campaigns[evs[i].campId]) continue;
+        out.push(evs[i]);
+      }
     } catch (e2) {
       Logger.log('Skipping unreadable change event: ' + e2);
     }
@@ -1202,8 +1224,10 @@ function actionCommentary_(c) {
  * The table lists every relevant change (newest first) with old -> new
  * values plus spend and ROAS/CPA in the 7 days before vs after, and a
  * direction-aware Impact % (positive = improved, for ROAS and CPA alike).
- * The change log only reaches back 30 days, so nothing older ever appears -
- * schedule the script weekly and the sheet becomes the rolling record.
+ * The change log API only exposes the last 30 days, so each run's pull is
+ * merged into a JSON archive camouflaged on the sheet (col AU): history
+ * accumulates across runs, and a change's before/after numbers are frozen
+ * into the archive once it scrolls out of the daily window.
  *
  * Helper zone geometry (headers row 2, data from row 3):
  *   P1      filter criteria cell
@@ -1212,24 +1236,32 @@ function actionCommentary_(c) {
  *   AG..AI  change rows      (Date|Campaign|Week)
  *   AK..AN  daily chart source  (Date|Target|Actual|Change)
  *   AP..AS  weekly chart source (Week|Target|Actual|Change)
+ *   AU      change archive (one JSON record per row, survives re-runs)
  */
 function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
                                weeklyAll, changes, changesError) {
+  // Read the archive BEFORE resetting the sheet, then fold this run's fresh
+  // pull into it - this is what lets the tab accumulate change history far
+  // beyond the API's 30-day retention.
+  var archive = readChangeArchive_(ss);
   var sh = resetSheet_(ss, 'Change Impact');
+  changes = mergeChanges_(changes, archive);
 
   title_(sh, 1, 'Change Impact - budget & bid strategy changes vs performance',
          12);
   subtitle_(sh, 2, 'Charts: navy = current stated target (cost-weighted), ' +
       'light blue = actual ' + primaryMetric + ', yellow dots = days/weeks ' +
       'with a budget or bid strategy change for the filtered campaign(s). ' +
-      'Table: every change in the last ' + daily.dates.length + ' days ' +
-      '(Google Ads keeps only 30 days of change history) with performance ' +
-      '7 days before vs after. All money in ' + currency + '.');
+      'Table: every change this sheet has ever seen, with performance 7 ' +
+      'days before vs after - fresh pulls reach back ' + daily.dates.length +
+      ' days (the API keeps only 30) and are archived in the sheet across ' +
+      'runs. All money in ' + currency + '.');
 
   if (!daily.rows.length) {
     sh.getRange(4, 1).setValue('No daily performance data available for ' +
         'this window - charts and change matching need spend to plot.')
         .setFontColor('#666666');
+    writeChangeArchive_(sh, changes); // resetSheet_ wiped it - put it back
     finishSheet_(sh);
     return;
   }
@@ -1396,15 +1428,12 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
   headerBand_(sh, TBL, headers.length);
 
   var noteRow;
-  if (changesError) {
+  if (!changes.length) {
     sh.getRange(TBL + 1, 1, 1, headers.length).merge()
-        .setValue('Change history unavailable this run: ' + changesError)
-        .setFontColor('#666666').setFontStyle('italic');
-    noteRow = TBL + 3;
-  } else if (!changes.length) {
-    sh.getRange(TBL + 1, 1, 1, headers.length).merge()
-        .setValue('No budget or bid strategy changes recorded in the last ' +
-                  daily.dates.length + ' days.')
+        .setValue(changesError
+            ? 'Change history unavailable this run: ' + changesError
+            : 'No budget or bid strategy changes recorded in the last ' +
+              daily.dates.length + ' days.')
         .setFontColor('#666666').setFontStyle('italic');
     noteRow = TBL + 3;
   } else {
@@ -1426,8 +1455,8 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
     var out = changes.map(function(g) {
       var c = g.campId ? cmap[g.campId] : null;
       var costB = '', costA = '', mB = '', mA = '', impact = '', mType = '';
-      if (c) {
-        mType = c.metricType;
+      if (c) mType = c.metricType;
+      if (c && g.date >= daily.start) {
         // Before: the 7 days up to and excluding the change day, clipped to
         // the data window; After: the 7 days from the day following the
         // change, clipped to yesterday. ISO strings compare lexically.
@@ -1459,6 +1488,17 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
         } else if (mB !== '' && mB !== 0 && mA !== '') {
           impact = mType === 'ROAS' ? (mA - mB) / mB : (mB - mA) / mB;
         }
+        // Carried into the sheet archive so the numbers survive once the
+        // change scrolls out of the daily window.
+        g.saved = { costB: costB, costA: costA, mB: mB, mA: mA, impact: impact };
+      } else if (g.saved) {
+        // Older than the daily window: reuse the values computed while the
+        // change was fresh.
+        costB = g.saved.costB != null ? g.saved.costB : '';
+        costA = g.saved.costA != null ? g.saved.costA : '';
+        mB = g.saved.mB != null ? g.saved.mB : '';
+        mA = g.saved.mA != null ? g.saved.mA : '';
+        impact = g.saved.impact != null ? g.saved.impact : '';
       }
       var pct = '';
       if (g.numeric && typeof g.old === 'number' &&
@@ -1495,14 +1535,17 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
     tableStyle_(sh, TBL, 1, out.length + 1, headers.length);
     noteRow = TBL + out.length + 2;
   }
+  writeChangeArchive_(sh, changes);
 
   var notes = [
     'How to read this',
-    'Change history comes from the account\'s own change log (change_event) ' +
-      'and only reaches back 30 days - run the script weekly and this tab ' +
-      'becomes the rolling record of every budget and bid strategy move. ' +
-      'Today\'s changes appear immediately (metrics run to yesterday, so ' +
-      'their impact reads "Too early").',
+    'Change history comes from the account\'s own change log (change_event). ' +
+      'Google only exposes the last 30 days, so anything changed before this ' +
+      'script\'s first run is unrecoverable - but every pull is archived ' +
+      'inside this sheet and merged on each run, so the table and chart ' +
+      'markers accumulate history from here on (capped at the 400 most ' +
+      'recent). Today\'s changes appear immediately (metrics run to ' +
+      'yesterday, so their impact reads "Too early").',
     'Impact is direction-aware: positive = improved (ROAS up, CPA down), ' +
       'comparing the 7 days after the change (excluding the change day) to ' +
       'the 7 days before. It needs at least 3 days of data each side; red ' +
@@ -1521,6 +1564,10 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
       'so their before/after columns stay blank; changes to shared budgets ' +
       'may not attribute to a single campaign either.'
   ];
+  if (changesError && changes.length) {
+    notes.splice(1, 0, 'This run could not pull fresh changes (' +
+        changesError + ') - the table shows previously archived history only.');
+  }
   notes.forEach(function(n, i) {
     var cell = sh.getRange(noteRow + i, 1, 1, headers.length);
     cell.merge().setValue(n).setWrap(true).setFontSize(9)
@@ -1533,9 +1580,9 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
   // Camouflage the helper zone (cols P..AS) - same arrangement as Summary:
   // sources must stay on this sheet and unhidden, so they go white 6pt in
   // pencil-thin columns instead.
-  sh.getRange(1, 16, Math.min(sh.getMaxRows(), Math.max(needRows, 1000)), 30)
+  sh.getRange(1, 16, Math.min(sh.getMaxRows(), Math.max(needRows, 1000)), 32)
       .setFontColor('#FFFFFF').setFontSize(6);
-  sh.setColumnWidths(16, 30, 26);
+  sh.setColumnWidths(16, 32, 26);
 
   sh.setColumnWidths(1, 1, 90);   // Date
   sh.setColumnWidths(2, 1, 55);   // Time
@@ -1788,6 +1835,70 @@ function stratName_(resourceName, portfolios) {
   var s = String(resourceName || '');
   if (!s) return '(none)';
   return (portfolios[s] && portfolios[s].name) || s;
+}
+
+// Naming convention, applied on every run so it covers spreadsheets created
+// blank via the URL config as well as fresh ones.
+function applySheetName_(ss, accountName, scriptName) {
+  var name = accountName + ' | ' + scriptName + ' | by Camilo - holastudio.com.au';
+  try {
+    if (ss.getName() !== name) ss.rename(name);
+  } catch (e) {
+    Logger.log('Could not rename spreadsheet: ' + e);
+  }
+}
+
+// The sheet-resident change archive: one JSON record per row, camouflaged in
+// col AU of the Change Impact tab. This is what makes the change table a
+// rolling record - the API forgets changes after 30 days, the sheet doesn't.
+var ARCHIVE_COL = 47; // AU
+
+function readChangeArchive_(ss) {
+  var sh = ss.getSheetByName('Change Impact');
+  if (!sh) return [];
+  var out = [];
+  try {
+    var last = sh.getLastRow();
+    if (last < 3) return [];
+    var vals = sh.getRange(3, ARCHIVE_COL, last - 2, 1).getValues();
+    vals.forEach(function(v) {
+      if (!v[0]) return;
+      try {
+        var g = JSON.parse(String(v[0]));
+        if (g && g.date && g.what) out.push(g);
+      } catch (ignored) {}
+    });
+  } catch (e) {
+    Logger.log('Change archive unreadable, starting fresh: ' + e);
+  }
+  return out;
+}
+
+function writeChangeArchive_(sh, changes) {
+  if (!changes.length) return;
+  sh.getRange(2, ARCHIVE_COL).setValue('Archive - do not edit');
+  var rows = changes.map(function(g) { return [JSON.stringify(g)]; });
+  sh.getRange(3, ARCHIVE_COL, rows.length, 1).setValues(rows);
+}
+
+// Fresh pull + archive, newest first, deduped on (date, time, campaign,
+// change, old, new), capped so the archive cannot grow without bound.
+function mergeChanges_(fresh, archive) {
+  var seen = {}, out = [];
+  function keyOf(g) {
+    return [g.date, g.time, g.label, g.what, g.old, g.nw].join('|');
+  }
+  fresh.concat(archive).forEach(function(g) {
+    var k = keyOf(g);
+    if (seen[k]) return;
+    seen[k] = true;
+    out.push(g);
+  });
+  out.sort(function(a, b) {
+    return a.date < b.date ? 1 : a.date > b.date ? -1
+         : a.time < b.time ? 1 : a.time > b.time ? -1 : 0;
+  });
+  return out.slice(0, 400);
 }
 
 function prettyStrategyType_(t) {
