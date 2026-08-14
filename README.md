@@ -32,18 +32,24 @@ per campaign whose target should move, timed before/after 17 Aug),
 dots marking the days/weeks a budget or bid strategy change was made — both
 filterable by campaign — plus a change-history table from the account's own
 change log with old→new values and the 7-days-before vs 7-days-after
-ROAS/CPA impact of each change; the log only reaches back 30 days, so run
-weekly to keep a rolling record), and **Campaign Data** (all windows,
-actionable rows highlighted). Install in a single account: Tools > Bulk
-actions > Scripts, paste, authorise, run; leave `SPREADSHEET_URL` blank on
-first run, then pin the logged URL.
+ROAS/CPA impact of each change; Google's log only exposes the last 30 days,
+but each pull is archived inside the sheet so history accumulates across
+runs), and **Campaign Data** (all windows, actionable rows highlighted).
+Campaigns with 60-day cost under `MIN_COST_60D` (default 100, account
+currency) are excluded from every tab, chart and dropdown so tiny/stale
+campaigns don't clutter the views. Each run also names the workbook
+`Account Name | Bid Strategy Audit | by Camilo - holastudio.com.au`.
+Install in a single account: Tools > Bulk actions > Scripts, paste,
+authorise, run; leave `SPREADSHEET_URL` blank on first run, then pin the
+logged URL.
 
 ### `mcc-bid-strategy-audit.js` (manager level)
 
 Installs once at MCC level, audits up to 50 child accounts per run in
 parallel (batch bigger MCCs with `ACCOUNT_LABEL` / `ACCOUNT_IDS`), writes
 each account its own four-tab audit workbook (including the same Change
-Impact tab) plus an MCC **Overview** ranking accounts most-urgent-first
-with links to every audit. Run once with
+Impact tab, spend floor and auto-naming) plus an MCC **Overview** ranking
+accounts most-urgent-first with links to every audit — named
+`MCC Name | Bid Strategy Audit - MCC Overview | by Camilo - holastudio.com.au`. Run once with
 `MASTER_SPREADSHEET_URL` blank, then paste the logged Overview URL into the
 config so re-runs reuse the same sheets. `LOW_SPEND_FLOOR` defaults to 0.
