@@ -747,15 +747,17 @@ function fetchAllWeeklyRows_(endIso, campaigns) {
 // (change_event). The resource only retains 30 days and requires an explicit
 // datetime range plus a LIMIT, so the window is capped at 29 days ending
 // today - today's changes surface immediately even though metrics run to
-// yesterday. Only UPDATE operations on campaigns and campaign budgets are
-// pulled - the change log's enum does not include portfolio bidding
-// strategies (BAD_ENUM_CONSTANT if requested), so target edits made at
-// portfolio level never appear in Google's change history at all. Each event
-// is parsed down to the budget/bidding deltas the audit cares about (name
-// edits etc. are dropped).
+// yesterday. Campaigns, campaign budgets and campaign criteria (bid
+// adjustments) are pulled; each event is parsed down to the budget/bidding
+// deltas the audit cares about (name edits etc. are dropped). Portfolio
+// bidding strategy edits never appear - Google's change log has no enum
+// value for them (BAD_ENUM_CONSTANT if requested).
+var CHANGE_PULL_STATS = { rows: 0, kept: 0, samples: [] };
+
 function fetchChangeEvents_(tz, campaigns, portfolios) {
   var today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
   var start = shiftDays_(today, -changeWindowDays_());
+  CHANGE_PULL_STATS = { rows: 0, kept: 0, samples: [] };
 
   function query(withAttribution) {
     return 'SELECT change_event.change_date_time, ' +
@@ -767,8 +769,8 @@ function fetchChangeEvents_(tz, campaigns, portfolios) {
       'FROM change_event ' +
       "WHERE change_event.change_date_time >= '" + start + " 00:00:00' " +
       " AND change_event.change_date_time <= '" + today + " 23:59:59' " +
-      " AND change_event.resource_change_operation = 'UPDATE' " +
-      " AND change_event.change_resource_type IN ('CAMPAIGN', 'CAMPAIGN_BUDGET') " +
+      " AND change_event.change_resource_type IN ('CAMPAIGN', " +
+      "  'CAMPAIGN_BUDGET', 'CAMPAIGN_CRITERION') " +
       'ORDER BY change_event.change_date_time DESC ' +
       'LIMIT 9800';
   }
@@ -789,8 +791,10 @@ function fetchChangeEvents_(tz, campaigns, portfolios) {
   var out = [];
   while (rows.hasNext()) {
     var r = rows.next();
+    CHANGE_PULL_STATS.rows++;
     try {
       var evs = parseChangeEvent_(r, campaigns, portfolios);
+      if (!evs.length) sampleChange_(r); // remember what was dropped and why
       for (var i = 0; i < evs.length; i++) {
         // Changes on campaigns excluded from the report (no 60d spend, or
         // below MIN_COST_60D) would dangle - skip them.
@@ -799,27 +803,71 @@ function fetchChangeEvents_(tz, campaigns, portfolios) {
       }
     } catch (e2) {
       Logger.log('Skipping unreadable change event: ' + e2);
+      sampleChange_(r);
     }
   }
+  CHANGE_PULL_STATS.kept = out.length;
+  Logger.log('Change history: ' + CHANGE_PULL_STATS.rows +
+             ' events pulled, ' + out.length + ' relevant deltas kept.');
   return out;
 }
 
+// Keeps a small distinct sample of dropped events so an empty change table
+// can say WHY it is empty (surfaced on the sheet and in the logs).
+function sampleChange_(r) {
+  var s = String(r['change_event.change_resource_type'] || '?') + ':' +
+      String(r['change_event.resource_change_operation'] || '?') + ':' +
+      (String(r['change_event.changed_fields'] || '').slice(0, 80) ||
+       '(no fields)');
+  if (CHANGE_PULL_STATS.samples.length < 6 &&
+      CHANGE_PULL_STATS.samples.indexOf(s) === -1) {
+    CHANGE_PULL_STATS.samples.push(s);
+  }
+}
+
 // One change_event row -> zero or more {date, time, campId, label, what,
-// old, nw, numeric, who} deltas, keeping only budget amounts and bidding
-// fields. old_resource/new_resource arrive as serialised proto JSON whose
-// key casing differs between runtimes - protoGet_ tries both.
+// old, nw, numeric, who} deltas, keeping only budget amounts, bidding
+// fields and bid adjustments. old_resource/new_resource arrive as
+// serialised proto JSON whose key casing differs between runtimes
+// (protoGet_ tries both), and changed_fields entries are matched with and
+// without their resource prefix. When a relevant field changed but the
+// values can't be read in this runtime's serialisation, the delta is still
+// emitted with blank old/new - seeing THAT a change happened matters more
+// than the numbers.
 function parseChangeEvent_(r, campaigns, portfolios) {
   var type = String(r['change_event.change_resource_type'] || '');
+  var op = String(r['change_event.resource_change_operation'] || '');
+  // Campaign/budget rows: only UPDATEs are adjustments (CREATE = new
+  // campaign, REMOVE = deletion). Criterion rows: a bid adjustment can
+  // arrive as CREATE (set), UPDATE (changed) or REMOVE (cleared), so all
+  // three pass through to the criterion branch.
+  if ((type === 'CAMPAIGN' || type === 'CAMPAIGN_BUDGET') && op !== 'UPDATE') {
+    return [];
+  }
   var fields = String(r['change_event.changed_fields'] || '')
       .replace(/[\[\]"]/g, '').split(',').map(function(f) { return f.trim(); });
+  function hasField(name) {
+    var suffix = '.' + name;
+    for (var i = 0; i < fields.length; i++) {
+      var f = fields[i];
+      if (f === name) return true;
+      if (f.length > suffix.length &&
+          f.lastIndexOf(suffix) === f.length - suffix.length) return true;
+    }
+    return false;
+  }
   var oldRes = safeJson_(r['change_event.old_resource']);
   var newRes = safeJson_(r['change_event.new_resource']);
   var dt = String(r['change_event.change_date_time'] || '');
   var resName = String(r['change_event.change_resource_name'] || '');
 
   var campId = String(r['campaign.id'] || '');
-  if (!campId && type === 'CAMPAIGN') {
-    var m = resName.match(/campaigns\/(\d+)/);
+  if (!campId) {
+    var m = null;
+    if (type === 'CAMPAIGN') m = resName.match(/campaigns\/(\d+)/);
+    else if (type === 'CAMPAIGN_CRITERION') {
+      m = resName.match(/campaignCriteria\/(\d+)~/);
+    }
     if (m) campId = m[1];
   }
   var known = campaigns[campId];
@@ -827,16 +875,15 @@ function parseChangeEvent_(r, campaigns, portfolios) {
 
   var deltas = [];
   function pushNum(field, what, path, isMicros) {
-    if (fields.indexOf(field) === -1) return;
+    if (!hasField(field)) return;
     var o = parseFloat(protoGet_(oldRes, path));
     var n = parseFloat(protoGet_(newRes, path));
     o = isFinite(o) ? (isMicros ? o / 1e6 : o) : null;
     n = isFinite(n) ? (isMicros ? n / 1e6 : n) : null;
-    if (o == null && n == null) return;
-    deltas.push({ what: what, old: o, nw: n, numeric: true });
+    deltas.push({ what: what, old: o, nw: n, numeric: o != null || n != null });
   }
   function pushText(field, what, oldV, newV) {
-    if (fields.indexOf(field) === -1) return;
+    if (!hasField(field)) return;
     deltas.push({ what: what, old: oldV, nw: newV, numeric: false });
   }
 
@@ -858,18 +905,35 @@ function parseChangeEvent_(r, campaigns, portfolios) {
             protoGet_(oldRes, ['campaign', 'bidding_strategy_type']) || '')),
         prettyStrategyType_(String(
             protoGet_(newRes, ['campaign', 'bidding_strategy_type']) || '')));
-    pushText('bidding_strategy', 'Portfolio strategy',
-        stratName_(protoGet_(oldRes, ['campaign', 'bidding_strategy']),
-                   portfolios),
-        stratName_(protoGet_(newRes, ['campaign', 'bidding_strategy']),
-                   portfolios));
+    if (!hasField('bidding_strategy_type')) {
+      pushText('bidding_strategy', 'Portfolio strategy',
+          stratName_(protoGet_(oldRes, ['campaign', 'bidding_strategy']),
+                     portfolios),
+          stratName_(protoGet_(newRes, ['campaign', 'bidding_strategy']),
+                     portfolios));
+    }
     pushText('campaign_budget', 'Budget assignment', '',
              'campaign moved to a different budget');
+  } else if (type === 'CAMPAIGN_CRITERION') {
+    // Platform/device/schedule bid adjustments live on campaign criteria.
+    // CREATE events carry no changed_fields, so read the modifier straight
+    // off the resources: 1.0 = no adjustment, 0 = -100%.
+    var oB = parseFloat(
+        protoGet_(oldRes, ['campaign_criterion', 'bid_modifier']));
+    var nB = parseFloat(
+        protoGet_(newRes, ['campaign_criterion', 'bid_modifier']));
+    var hasO = isFinite(oB), hasN = isFinite(nB);
+    if (hasO || hasN) {
+      deltas.push({
+        what: op === 'REMOVE' ? 'Bid adjustment removed'
+            : op === 'CREATE' ? 'Bid adjustment set'
+            : 'Bid adjustment',
+        old: hasO ? oB : null,
+        nw: hasN ? nB : null,
+        numeric: true
+      });
+    }
   }
-  // NOTE: no BIDDING_STRATEGY branch - Google's change log does not record
-  // portfolio bidding strategy edits (the enum value doesn't exist), so a
-  // target moved at portfolio level is invisible here. A campaign being
-  // ATTACHED to a portfolio does appear (bidding_strategy field above).
   if (!label) label = '(unknown)';
 
   return deltas.map(function(d) {
@@ -1729,13 +1793,23 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
 
   var noteRow;
   if (!changes.length) {
-    sh.getRange(TBL + 1, 1, 1, headers.length).merge()
-        .setValue(changesError
-            ? 'Change history unavailable this run: ' + changesError
-            : 'No budget or bid strategy changes recorded in the last ' +
-              daily.dates.length + ' days.')
-        .setFontColor('#666666').setFontStyle('italic');
-    noteRow = TBL + 3;
+    var emptyMsg;
+    if (changesError) {
+      emptyMsg = 'Change history unavailable this run: ' + changesError;
+    } else if (CHANGE_PULL_STATS.rows > 0) {
+      // Self-diagnosis: events came back but none matched - print what they
+      // were so the gap can be identified from the sheet alone.
+      emptyMsg = CHANGE_PULL_STATS.rows + ' change events were pulled in the ' +
+          'last ' + daily.dates.length + ' days but none carried ' +
+          'budget/bidding fields. Samples (type:operation:changed_fields): ' +
+          CHANGE_PULL_STATS.samples.join('   |   ');
+    } else {
+      emptyMsg = 'No budget or bid strategy changes recorded in the last ' +
+          daily.dates.length + ' days.';
+    }
+    sh.getRange(TBL + 1, 1, 1, headers.length).merge().setValue(emptyMsg)
+        .setFontColor('#666666').setFontStyle('italic').setWrap(true);
+    noteRow = TBL + 4;
   } else {
     var byCamp = {};
     daily.rows.forEach(function(x) {
@@ -1860,12 +1934,13 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
     'To filter the TABLE by campaign use Data > Create a filter view (a ' +
       'plain filter hides rows, which would blank the charts\' camouflaged ' +
       'source data sitting on the same rows).',
-    'Blind spot: Google\'s change log records campaign and budget edits ' +
-      'only - a target moved at PORTFOLIO strategy level never appears in ' +
-      'it (attaching/detaching a campaign to a portfolio does). If a ' +
-      'portfolio target moves, note it manually or move targets at campaign ' +
-      'level. Changes to shared budgets may not attribute to a single ' +
-      'campaign.'
+    'Coverage: campaign target/strategy edits, budget amounts and bid ' +
+      'adjustments (platform/device/schedule criteria). Blind spot: a ' +
+      'target moved at PORTFOLIO strategy level never appears in Google\'s ' +
+      'change log (attaching/detaching a campaign to a portfolio does) - ' +
+      'note those manually or move targets to campaign level. Shared-budget ' +
+      'changes may not attribute to a single campaign. Bid adjustment ' +
+      'values are multipliers: 1.1 = +10%, 0 = -100%.'
   ];
   if (changesError && changes.length) {
     notes.splice(1, 0, 'This run could not pull fresh changes (' +
