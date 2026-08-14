@@ -39,10 +39,14 @@ Campaigns with 60-day cost under `MIN_COST_60D` (default 100, account
 currency) are excluded from every tab, chart and dropdown so tiny/stale
 campaigns don't clutter the views. Campaigns whose Conversions column is
 fed by multiple conversion actions are flagged — **Mixed-value goals**
-when 2+ of them record value (hybrid accounts: online revenue alongside
-begin-checkout value, or several valued lead goals), **Multi-goal**
-otherwise — with the goal names listed and a side note in the Actionable
-commentary, since windowed ROAS/CPA blends those goals. Each run also names the workbook
+when 2+ primary actions each record a material (≥5%) share of value
+(hybrid accounts: online revenue alongside begin-checkout value),
+**Multi-goal** otherwise — with the goal names listed and a side note in
+the Actionable commentary. Hybrid mixed-value campaigns get a **softer
+decay bar** (measured 30d vs 14d, thresholds doubled to −40%/−20%)
+because one high-AOV sale swings a short blended-ROAS window; plain
+multi-goal lead-gen setups (lead form + phone call tracked as equals)
+keep the standard bar and are flagged for context only. Each run also names the workbook
 `Account Name | Bid Strategy Audit | by Camilo - holastudio.com.au`.
 Install in a single account: Tools > Bulk actions > Scripts, paste,
 authorise, run; leave `SPREADSHEET_URL` blank on first run, then pin the
