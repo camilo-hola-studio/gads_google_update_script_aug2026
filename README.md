@@ -28,13 +28,13 @@ Four-tab audit workbook per account: **Summary** (target-split pies, the
 interactive 8-week target-vs-actual chart with campaign filter and decay
 trend line, campaign table with 30/14/7d actuals), **Actionable** (one row
 per campaign whose target should move, timed before/after 17 Aug),
-**Change Impact** (daily and weekly target-vs-actual charts with yellow
-dots marking the days/weeks a budget or bid strategy change was made — both
-filterable by campaign — plus a change-history table from the account's own
-change log with old→new values and the 7-days-before vs 7-days-after
-ROAS/CPA impact of each change; Google's log only exposes the last 30 days,
-but each pull is archived inside the sheet so history accumulates across
-runs), and **Campaign Data** (all windows, actionable rows highlighted).
+**Change Impact / Targets vs Actuals** (daily and weekly
+target-vs-actual charts, both filterable by campaign; with
+`TRACK_CHANGES: true` the tab additionally pulls the account's change log —
+yellow dots marking change days/weeks plus a change-history table with
+old→new values and 7-days-before vs 7-days-after impact, archived in-sheet
+beyond Google's 30-day retention. Off by default, the tab is charts only),
+and **Campaign Data** (all windows, actionable rows highlighted).
 Campaigns with 60-day cost under `MIN_COST_60D` (default 100, account
 currency) are excluded from every tab, chart and dropdown so tiny/stale
 campaigns don't clutter the views. Campaigns whose Conversions column is
