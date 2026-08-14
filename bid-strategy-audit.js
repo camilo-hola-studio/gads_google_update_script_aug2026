@@ -636,7 +636,12 @@ function parseChangeEvent_(r, campaigns, portfolios) {
     return [];
   }
   var fields = String(r['change_event.changed_fields'] || '')
-      .replace(/[\[\]"]/g, '').split(',').map(function(f) { return f.trim(); });
+      .replace(/[\[\]"]/g, '').split(',').map(function(f) {
+        // The runtime serialises field masks in camelCase
+        // (maximizeConversionValue.targetRoas) - normalise to snake_case so
+        // one spelling matches regardless of runtime.
+        return f.trim().replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+      });
   function hasField(name) {
     var suffix = '.' + name;
     for (var i = 0; i < fields.length; i++) {
