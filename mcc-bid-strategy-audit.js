@@ -308,6 +308,15 @@ function runAudit_() {
   attachWindow_(campaigns, 'w14', ranges.w14);
   attachWindow_(campaigns, 'w7', ranges.w7);
 
+  // Which conversion actions feed each campaign's Conversions column over
+  // the base window - powers the multi-goal / mixed-value-goal side notes.
+  // Guarded: a failure only costs those notes, never the run.
+  try {
+    fetchConversionGoals_(ranges.base, campaigns);
+  } catch (e) {
+    Logger.log('Conversion goal split skipped: ' + e);
+  }
+
   var list = [];
   for (var id in campaigns) list.push(campaigns[id]);
   list.sort(function(a, b) { return b.base.cost - a.base.cost; });
@@ -600,6 +609,33 @@ function attachWindow_(campaigns, key, range) {
       value: num_(r['metrics.conversions_value']),
       conv: num_(r['metrics.conversions'])
     };
+  }
+}
+
+// Per-campaign split of the Conversions column by conversion action.
+// metrics.conversions / conversions_value only count actions INCLUDED in
+// bidding, so 2+ actions here means the campaign genuinely optimises toward
+// multiple goals - and 2+ value-recording actions means its windowed ROAS
+// blends different kinds of value (hybrid accounts: begin-checkout revenue
+// alongside purchases, or several valued lead goals).
+function fetchConversionGoals_(range, campaigns) {
+  var rows = AdsApp.report(
+    'SELECT campaign.id, segments.conversion_action_name, ' +
+    ' metrics.conversions, metrics.conversions_value ' +
+    'FROM campaign ' +
+    "WHERE campaign.status = 'ENABLED' " +
+    ' AND metrics.conversions > 0 ' +
+    " AND segments.date BETWEEN '" + range.start + "' AND '" + range.end + "'"
+  ).rows();
+  while (rows.hasNext()) {
+    var r = rows.next();
+    var c = campaigns[String(r['campaign.id'])];
+    if (!c) continue;
+    (c.goals = c.goals || []).push({
+      name: String(r['segments.conversion_action_name'] || ''),
+      conv: num_(r['metrics.conversions']),
+      value: num_(r['metrics.conversions_value'])
+    });
   }
 }
 
@@ -951,10 +987,30 @@ function deriveCampaign_(c, primaryMetric, totalCost) {
   else if (c.gap < -0.20) c.segment = 'Missing target >20%';
   else c.segment = 'Within +/-20% of target';
 
+  // Multi-goal detection: 2+ conversion actions feeding the Conversions
+  // column means bidding blends goals; 2+ of them recording value means the
+  // windowed ROAS blends different kinds of value (hybrid accounts).
+  var goals = (c.goals || []).slice().sort(function(a, b) {
+    return b.value - a.value || b.conv - a.conv;
+  });
+  c.goalCount = goals.length;
+  c.valueGoalCount = goals.filter(function(g) { return g.value > 0; }).length;
+  c.multiGoal = c.goalCount >= 2;
+  c.multiValueGoal = c.valueGoalCount >= 2;
+  var goalNames = goals.map(function(g) { return g.name; });
+  c.goalsDetail = goalNames.slice(0, 4).join(', ') +
+      (goalNames.length > 4 ? ' +' + (goalNames.length - 4) + ' more' : '');
+  c.goalsSummary = !c.goalCount ? '-'
+      : c.goalCount === 1 ? goalNames[0]
+      : c.goalCount + ' goals' +
+        (c.multiValueGoal ? ' (' + c.valueGoalCount + ' record value)' : '');
+
   var flags = [];
   if (c.hasTarget && c.aboveFloor) flags.push(c.priority);
   if (c.budgetLimited) flags.push('Budget-limited');
   if (c.portfolio) flags.push('Portfolio strategy');
+  if (c.multiValueGoal) flags.push('Mixed-value goals');
+  else if (c.multiGoal) flags.push('Multi-goal');
   c.flag = flags.join('; ') || '-';
 
   c.actionable = c.hasTarget && c.aboveFloor &&
@@ -1088,7 +1144,7 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
   var hdrRow = 36;
   var headers = ['Campaign', 'Bid Strategy', 'Target Type', 'Target',
                  'Actual 30d', 'Actual 14d', 'Actual 7d', 'Trend 30d>7d',
-                 'Priority'];
+                 'Priority', 'Conv. goals (60d)'];
   sh.getRange(hdrRow, 1, 1, headers.length).setValues([headers]);
   headerBand_(sh, hdrRow, headers.length);
 
@@ -1101,7 +1157,8 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
       c.m14 != null ? round2_(c.m14) : '',
       c.m7 != null ? round2_(c.m7) : '',
       c.trend != null ? c.trend : '',
-      c.priority
+      c.priority,
+      c.goalsSummary
     ]);
   });
   if (out.length) {
@@ -1163,6 +1220,11 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
       'the script rebuild it.',
     'Scope: only campaigns that are currently enabled AND spent in the last 60 days are ' +
       'included. Paused, removed and zero-spend campaigns are ignored entirely.',
+    'Mixed-value goals = the campaign optimises toward 2+ conversion actions that EACH record ' +
+      'value (hybrid setups: e.g. online revenue alongside begin-checkout value, or several ' +
+      'valued lead goals like brochure + appointment). Windowed ROAS/CPA blends those goals, ' +
+      'so read targets and gaps against the blended value, not pure sales revenue. ' +
+      'Multi-goal = 2+ actions counted but at most one records value; CPA blends them.',
     (CONFIG.LOW_SPEND_FLOOR > 0
       ? 'Decay on low-spend campaigns (< ' + CONFIG.LOW_SPEND_FLOOR + ' ' + currency +
         ' over 60d) is volatile - shown for context, never flagged for action. '
@@ -1183,6 +1245,7 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
 
   sh.setColumnWidths(1, 1, 280);
   sh.setColumnWidths(2, 8, 120);
+  sh.setColumnWidths(10, 1, 190);
   finishSheet_(sh);
 }
 
@@ -1414,6 +1477,17 @@ function actionCommentary_(c) {
   }
   if (c.budgetLimited) {
     parts.push('budget-limited: in the directly-affected set for 17 Aug');
+  }
+  // Hybrid-account side note: when bidding chases several goals the windowed
+  // ROAS/CPA blends them, so the target maths reads differently.
+  if (c.multiValueGoal) {
+    parts.push('NOTE: optimises toward ' + c.valueGoalCount +
+               ' value-recording goals (' + c.goalsDetail + ') - windowed ' +
+               'ROAS blends their values, so judge the target against the ' +
+               'blended value, not sales revenue alone');
+  } else if (c.multiGoal) {
+    parts.push('NOTE: optimises toward ' + c.goalCount +
+               ' conversion goals (' + c.goalsDetail + ') - CPA blends them');
   }
   return parts.join('; ') + '.';
 }
@@ -1821,7 +1895,7 @@ function buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost) {
                  'Target Type', 'Target', 'Budget-limited', 'Cost 60d',
                  '% of Spend', 'Metric', 'ROAS/CPA 60d', 'ROAS/CPA 30d',
                  'ROAS/CPA 14d', 'ROAS/CPA 7d', 'Gap vs Target',
-                 'Trend 30d>7d', 'Segment', 'Flag'];
+                 'Trend 30d>7d', 'Segment', 'Flag', 'Conv. goals (60d)'];
   sh.getRange(2, 1, 1, headers.length).setValues([headers]);
   headerBand_(sh, 2, headers.length);
 
@@ -1839,7 +1913,8 @@ function buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost) {
       c.m7 != null ? round2_(c.m7) : '',
       c.gap != null ? c.gap : '',
       c.trend != null ? c.trend : '',
-      c.segment, c.flag
+      c.segment, c.flag,
+      c.goalCount ? c.goalsDetail : '-'
     ];
   });
   if (out.length) {
@@ -1873,6 +1948,8 @@ function buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost) {
   sh.setFrozenColumns(1);
   sh.setColumnWidths(1, 1, 280);
   sh.setColumnWidths(2, 17, 110);
+  sh.setColumnWidths(19, 1, 280);
+  sh.getRange(3, 19, Math.max(out.length, 1), 1).setWrap(true);
   finishSheet_(sh);
 }
 
