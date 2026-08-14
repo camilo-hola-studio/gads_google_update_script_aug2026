@@ -747,9 +747,12 @@ function fetchAllWeeklyRows_(endIso, campaigns) {
 // (change_event). The resource only retains 30 days and requires an explicit
 // datetime range plus a LIMIT, so the window is capped at 29 days ending
 // today - today's changes surface immediately even though metrics run to
-// yesterday. Only UPDATE operations on campaigns, campaign budgets and
-// portfolio bidding strategies are pulled; each event is parsed down to the
-// budget/bidding deltas the audit cares about (name edits etc. are dropped).
+// yesterday. Only UPDATE operations on campaigns and campaign budgets are
+// pulled - the change log's enum does not include portfolio bidding
+// strategies (BAD_ENUM_CONSTANT if requested), so target edits made at
+// portfolio level never appear in Google's change history at all. Each event
+// is parsed down to the budget/bidding deltas the audit cares about (name
+// edits etc. are dropped).
 function fetchChangeEvents_(tz, campaigns, portfolios) {
   var today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
   var start = shiftDays_(today, -changeWindowDays_());
@@ -765,8 +768,7 @@ function fetchChangeEvents_(tz, campaigns, portfolios) {
       "WHERE change_event.change_date_time >= '" + start + " 00:00:00' " +
       " AND change_event.change_date_time <= '" + today + " 23:59:59' " +
       " AND change_event.resource_change_operation = 'UPDATE' " +
-      " AND change_event.change_resource_type IN ('CAMPAIGN', " +
-      "  'CAMPAIGN_BUDGET', 'BIDDING_STRATEGY') " +
+      " AND change_event.change_resource_type IN ('CAMPAIGN', 'CAMPAIGN_BUDGET') " +
       'ORDER BY change_event.change_date_time DESC ' +
       'LIMIT 9800';
   }
@@ -863,30 +865,11 @@ function parseChangeEvent_(r, campaigns, portfolios) {
                    portfolios));
     pushText('campaign_budget', 'Budget assignment', '',
              'campaign moved to a different budget');
-  } else if (type === 'BIDDING_STRATEGY') {
-    // Portfolio strategy: the change applies to every attached campaign at
-    // once, so it cannot be pinned on a single campaign's before/after.
-    var p = portfolios[resName];
-    label = 'Portfolio: ' + ((p && p.name) ||
-        String(protoGet_(newRes, ['bidding_strategy', 'name']) || '') ||
-        resName);
-    campId = '';
-    pushNum('target_roas.target_roas', 'Portfolio target ROAS',
-            ['bidding_strategy', 'target_roas', 'target_roas'], false);
-    pushNum('maximize_conversion_value.target_roas', 'Portfolio target ROAS',
-            ['bidding_strategy', 'maximize_conversion_value', 'target_roas'],
-            false);
-    pushNum('target_cpa.target_cpa_micros', 'Portfolio target CPA',
-            ['bidding_strategy', 'target_cpa', 'target_cpa_micros'], true);
-    pushNum('maximize_conversions.target_cpa_micros', 'Portfolio target CPA',
-            ['bidding_strategy', 'maximize_conversions', 'target_cpa_micros'],
-            true);
-    pushText('type', 'Portfolio strategy type',
-        prettyStrategyType_(String(
-            protoGet_(oldRes, ['bidding_strategy', 'type']) || '')),
-        prettyStrategyType_(String(
-            protoGet_(newRes, ['bidding_strategy', 'type']) || '')));
   }
+  // NOTE: no BIDDING_STRATEGY branch - Google's change log does not record
+  // portfolio bidding strategy edits (the enum value doesn't exist), so a
+  // target moved at portfolio level is invisible here. A campaign being
+  // ATTACHED to a portfolio does appear (bidding_strategy field above).
   if (!label) label = '(unknown)';
 
   return deltas.map(function(d) {
@@ -1877,9 +1860,12 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
     'To filter the TABLE by campaign use Data > Create a filter view (a ' +
       'plain filter hides rows, which would blank the charts\' camouflaged ' +
       'source data sitting on the same rows).',
-    'Portfolio strategy changes apply to every attached campaign at once, ' +
-      'so their before/after columns stay blank; changes to shared budgets ' +
-      'may not attribute to a single campaign either.'
+    'Blind spot: Google\'s change log records campaign and budget edits ' +
+      'only - a target moved at PORTFOLIO strategy level never appears in ' +
+      'it (attaching/detaching a campaign to a portfolio does). If a ' +
+      'portfolio target moves, note it manually or move targets at campaign ' +
+      'level. Changes to shared budgets may not attribute to a single ' +
+      'campaign.'
   ];
   if (changesError && changes.length) {
     notes.splice(1, 0, 'This run could not pull fresh changes (' +
