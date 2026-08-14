@@ -105,9 +105,9 @@ var COLORS = {
   YELLOW: '#F4B400',  // gap-vs-target series (contrast against blue/navy)
   BORDER: '#D9D9D9',  // light grey table borders
   WHITE: '#FFFFFF',
-  RED: '#F4C7C3',     // trend <= -20%
-  AMBER: '#FCE8B2',   // trend -10% .. -20%
-  GREEN: '#D9EAD3',   // trend > -10%
+  RED: '#F4C7C3',     // decay at/past the Act-now bar
+  AMBER: '#FCE8B2',   // decay between the Watch and Act-now bars
+  GREEN: '#D9EAD3',   // better than the Watch bar
   GREY: '#EFEFEF'     // no-target / low-spend rows
 };
 
@@ -210,8 +210,9 @@ function writeOverview_(master, rows) {
   title_(sh, 1, 'Bid Strategy Audit - MCC Overview', 12);
   subtitle_(sh, 2, 'One row per audited account, most urgent first. Run ' +
       Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm') + ' (' + tz +
-      '). "1 - Act now" counts campaigns whose 7d metric is decaying >=20% ' +
-      'vs 30d; Actionable adds campaigns >20% off their stated target.');
+      '). "1 - Act now" counts campaigns decaying past their Act-now bar ' +
+      '(20% vs 7d; hybrid mixed-value campaigns 40% vs 14d); Actionable ' +
+      'adds campaigns >20% off their stated target.');
 
   var headers = ['Account', 'CID', 'Campaigns', 'With target', 'Actionable',
                  '1 - Act now', 'Metric', 'Cost 60d (acct currency)',
@@ -939,6 +940,39 @@ function deriveCampaign_(c, primaryMetric, totalCost) {
   c.m14 = metricOf_(c.w14, c.metricType);
   c.m7 = metricOf_(c.w7, c.metricType);
 
+  // Multi-goal detection - derived BEFORE the trend, because hybrid
+  // campaigns get a softer decay treatment below. Only PRIMARY conversion
+  // actions appear here (metrics.conversions counts nothing else), and an
+  // action must carry a material share (>= 5% of the campaign's 60d
+  // conversions or value) to count as a goal - a stray action that
+  // converted once doesn't make a campaign multi-goal.
+  var allGoals = c.goals || [];
+  var totConv = 0, totVal = 0;
+  allGoals.forEach(function(g) { totConv += g.conv; totVal += g.value; });
+  var goals = allGoals.filter(function(g) {
+    return (totConv > 0 && g.conv / totConv >= 0.05) ||
+           (totVal > 0 && g.value / totVal >= 0.05);
+  }).sort(function(a, b) {
+    return b.value - a.value || b.conv - a.conv;
+  });
+  c.goalCount = goals.length;
+  c.valueGoalCount = goals.filter(function(g) {
+    return totVal > 0 && g.value / totVal >= 0.05;
+  }).length;
+  // Multi-goal: 2+ material primary actions counted - a deliberate, healthy
+  // setup on lead-gen accounts (lead form + phone call can matter equally),
+  // flagged for context only. Mixed-value ("hybrid"): 2+ of them EACH
+  // record material value, so windowed ROAS blends different kinds of value.
+  c.multiGoal = c.goalCount >= 2;
+  c.multiValueGoal = c.valueGoalCount >= 2;
+  var goalNames = goals.map(function(g) { return g.name; });
+  c.goalsDetail = goalNames.slice(0, 4).join(', ') +
+      (goalNames.length > 4 ? ' +' + (goalNames.length - 4) + ' more' : '');
+  c.goalsSummary = !c.goalCount ? '-'
+      : c.goalCount === 1 ? goalNames[0]
+      : c.goalCount + ' goals' +
+        (c.multiValueGoal ? ' (' + c.valueGoalCount + ' record value)' : '');
+
   // Gap vs Target respects direction: beating the target reads POSITIVE for
   // both metric types (higher ROAS is good, lower CPA is good).
   c.gap = null;
@@ -948,14 +982,19 @@ function deriveCampaign_(c, primaryMetric, totalCost) {
         : (c.target - c.m30) / c.target;
   }
 
-  // Trend 30d>7d ("decay"): negative = deteriorating, for both metric types.
-  // ROAS: (m7-m30)/m30. CPA equivalent: (m30-m7)/m30, so a rising CPA reads
-  // negative too.
+  // Decay trend: negative = deteriorating, for both metric types. Normally
+  // 30d vs 7d; hybrid (mixed-value-goal) campaigns are measured 30d vs 14d
+  // and held to doubled thresholds - with several value streams and high-AOV
+  // lumpiness, a 7-day blended ROAS swings on a single sale.
+  c.trendWindow = c.multiValueGoal ? '14d' : '7d';
+  c.actNowAt = c.multiValueGoal ? -0.40 : -0.20;
+  c.watchAt = c.multiValueGoal ? -0.20 : -0.10;
+  var shortM = c.multiValueGoal ? c.m14 : c.m7;
   c.trend = null;
-  if (c.m30 != null && c.m30 !== 0 && c.m7 != null) {
+  if (c.m30 != null && c.m30 !== 0 && shortM != null) {
     c.trend = c.metricType === 'ROAS'
-        ? (c.m7 - c.m30) / c.m30
-        : (c.m30 - c.m7) / c.m30;
+        ? (shortM - c.m30) / c.m30
+        : (c.m30 - shortM) / c.m30;
   }
 
   c.hasTarget = c.targetType !== 'None';
@@ -971,39 +1010,21 @@ function deriveCampaign_(c, primaryMetric, totalCost) {
     c.priority = 'Low spend - not flagged';
   } else if (c.trend == null) {
     c.priority = 'No recent data';
-  } else if (c.trend <= -0.20) {
+  } else if (c.trend <= c.actNowAt) {
     c.priority = '1 - Act now';
-  } else if (c.trend <= -0.10) {
+  } else if (c.trend <= c.watchAt) {
     c.priority = '2 - Watch';
   } else {
     c.priority = '3 - Stable';
   }
 
-  // Segment (no name-based inference — target status, spend floor, gap band).
+  // Segment (no name-based inference - target status, spend floor, gap band).
   if (!c.hasTarget) c.segment = 'No target';
   else if (!c.aboveFloor) c.segment = 'Targeted - low spend';
   else if (c.gap == null) c.segment = 'Within +/-20% of target';
   else if (c.gap > 0.20) c.segment = 'Beating target >20%';
   else if (c.gap < -0.20) c.segment = 'Missing target >20%';
   else c.segment = 'Within +/-20% of target';
-
-  // Multi-goal detection: 2+ conversion actions feeding the Conversions
-  // column means bidding blends goals; 2+ of them recording value means the
-  // windowed ROAS blends different kinds of value (hybrid accounts).
-  var goals = (c.goals || []).slice().sort(function(a, b) {
-    return b.value - a.value || b.conv - a.conv;
-  });
-  c.goalCount = goals.length;
-  c.valueGoalCount = goals.filter(function(g) { return g.value > 0; }).length;
-  c.multiGoal = c.goalCount >= 2;
-  c.multiValueGoal = c.valueGoalCount >= 2;
-  var goalNames = goals.map(function(g) { return g.name; });
-  c.goalsDetail = goalNames.slice(0, 4).join(', ') +
-      (goalNames.length > 4 ? ' +' + (goalNames.length - 4) + ' more' : '');
-  c.goalsSummary = !c.goalCount ? '-'
-      : c.goalCount === 1 ? goalNames[0]
-      : c.goalCount + ' goals' +
-        (c.multiValueGoal ? ' (' + c.valueGoalCount + ' record value)' : '');
 
   var flags = [];
   if (c.hasTarget && c.aboveFloor) flags.push(c.priority);
@@ -1015,7 +1036,7 @@ function deriveCampaign_(c, primaryMetric, totalCost) {
 
   c.actionable = c.hasTarget && c.aboveFloor &&
       ((c.gap != null && Math.abs(c.gap) > 0.20) ||
-       (c.trend != null && c.trend <= -0.20));
+       (c.trend != null && c.trend <= c.actNowAt));
 }
 
 /**
@@ -1143,7 +1164,7 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
   // ---- Full campaign table below the charts. ----
   var hdrRow = 36;
   var headers = ['Campaign', 'Bid Strategy', 'Target Type', 'Target',
-                 'Actual 30d', 'Actual 14d', 'Actual 7d', 'Trend 30d>7d',
+                 'Actual 30d', 'Actual 14d', 'Actual 7d', 'Decay trend',
                  'Priority', 'Conv. goals (60d)'];
   sh.getRange(hdrRow, 1, 1, headers.length).setValues([headers]);
   headerBand_(sh, hdrRow, headers.length);
@@ -1176,11 +1197,12 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
           : null;
       var row = [];
       for (var k = 0; k < headers.length; k++) row.push(wash);
-      // Column 8 = Trend 30d>7d: grey for no-target/low-spend/no-data rows,
-      // red/amber/green on the priority thresholds otherwise.
+      // Column 8 = Decay trend: grey for no-target/low-spend/no-data rows,
+      // red/amber/green against the campaign's OWN thresholds - hybrid
+      // mixed-value campaigns carry a doubled bar (see deriveCampaign_).
       if (!c.hasTarget || !c.aboveFloor || c.trend == null) row[7] = COLORS.GREY;
-      else if (c.trend <= -0.20) row[7] = COLORS.RED;
-      else if (c.trend <= -0.10) row[7] = COLORS.AMBER;
+      else if (c.trend <= c.actNowAt) row[7] = COLORS.RED;
+      else if (c.trend <= c.watchAt) row[7] = COLORS.AMBER;
       else row[7] = COLORS.GREEN;
       return row;
     });
@@ -1203,8 +1225,10 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
       '(no native windowed column exists). ROAS = value/cost; CPA = cost/conversions; ' +
       'blanks mean the denominator was zero.',
     'Gap vs Target is direction-aware: beating the target reads positive for both ROAS and ' +
-      'CPA. Trend 30d>7d: negative always means deteriorating. Priority: <= -20% = Act now; ' +
-      '-10% to -20% = Watch; else Stable.',
+      'CPA. Decay trend: negative always means deteriorating; normally 30d vs 7d, with Act ' +
+      'now <= -20% and Watch <= -10%. Hybrid campaigns (Mixed-value goals flag) get a softer ' +
+      'bar - measured 30d vs 14d with thresholds doubled (Act now <= -40%, Watch <= -20%) - ' +
+      'because one high-AOV sale swings a short blended-ROAS window.',
     'Budget-limited via ' +
       (BUDGET_LIMITED_METHOD === 'primary_status_reasons'
         ? 'the platform\'s own status (primary_status_reasons: BUDGET_CONSTRAINED).'
@@ -1220,11 +1244,14 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
       'the script rebuild it.',
     'Scope: only campaigns that are currently enabled AND spent in the last 60 days are ' +
       'included. Paused, removed and zero-spend campaigns are ignored entirely.',
-    'Mixed-value goals = the campaign optimises toward 2+ conversion actions that EACH record ' +
-      'value (hybrid setups: e.g. online revenue alongside begin-checkout value, or several ' +
-      'valued lead goals like brochure + appointment). Windowed ROAS/CPA blends those goals, ' +
-      'so read targets and gaps against the blended value, not pure sales revenue. ' +
-      'Multi-goal = 2+ actions counted but at most one records value; CPA blends them.',
+    'Mixed-value goals = 2+ PRIMARY conversion actions each recording a material share of ' +
+      'value (>= 5% of the campaign\'s 60d value) - hybrid setups like online revenue ' +
+      'alongside begin-checkout value. Windowed ROAS blends those values, so these campaigns ' +
+      'get the softer decay bar above. Multi-goal = 2+ material primary actions counted but ' +
+      'at most one records value - a deliberate, healthy setup on lead-gen accounts (a lead ' +
+      'form can matter as much as a phone call when both are tracked properly); flagged for ' +
+      'context only, standard bar, since blended CPA is still one consistent number. ' +
+      'Secondary conversion actions never appear in these counts.',
     (CONFIG.LOW_SPEND_FLOOR > 0
       ? 'Decay on low-spend campaigns (< ' + CONFIG.LOW_SPEND_FLOOR + ' ' + currency +
         ' over 60d) is volatile - shown for context, never flagged for action. '
@@ -1398,7 +1425,8 @@ function buildActionableTab_(ss, list, primaryMetric, currency) {
   title_(sh, 1, 'Actionable - campaigns whose target should move', 12);
   subtitle_(sh, 2, 'Filter: carries a target, 60d cost >= ' +
       CONFIG.LOW_SPEND_FLOOR + ' ' + currency +
-      ', and |gap| > 20% or decay <= -20%. Ordered by 60d cost. ' +
+      ', and |gap| > 20% or decay past its bar (<= -20% vs 7d; hybrid ' +
+      'mixed-value campaigns <= -40% vs 14d). Ordered by 60d cost. ' +
       '"Before 17 Aug" rows are budget-limited: from that date they bid to the ' +
       'stated target instead of the level actually being achieved, so a stale ' +
       'target starts steering real spend. Proposed Target is seeded at the 30d ' +
@@ -1466,9 +1494,10 @@ function actionCommentary_(c) {
       parts.push('Within ' + pct + '% of ' + metric + ' target over 30d');
     }
   }
-  if (c.trend != null && c.trend <= -0.20) {
+  if (c.trend != null && c.trend <= c.actNowAt) {
     parts.push('decaying ' + Math.round(Math.abs(c.trend) * 100) +
-               '% (7d vs 30d)');
+               '% (' + c.trendWindow + ' vs 30d' +
+               (c.multiValueGoal ? ', past the softer hybrid bar' : '') + ')');
   }
   if (c.portfolio) {
     parts.push('portfolio strategy "' + c.portfolioName +
@@ -1487,7 +1516,9 @@ function actionCommentary_(c) {
                'blended value, not sales revenue alone');
   } else if (c.multiGoal) {
     parts.push('NOTE: optimises toward ' + c.goalCount +
-               ' conversion goals (' + c.goalsDetail + ') - CPA blends them');
+               ' conversion goals (' + c.goalsDetail + ') - CPA blends them, ' +
+               'which is fine when deliberate (e.g. lead form + phone call ' +
+               'tracked as equals)');
   }
   return parts.join('; ') + '.';
 }
@@ -1895,7 +1926,7 @@ function buildCampaignDataTab_(ss, list, primaryMetric, currency, totalCost) {
                  'Target Type', 'Target', 'Budget-limited', 'Cost 60d',
                  '% of Spend', 'Metric', 'ROAS/CPA 60d', 'ROAS/CPA 30d',
                  'ROAS/CPA 14d', 'ROAS/CPA 7d', 'Gap vs Target',
-                 'Trend 30d>7d', 'Segment', 'Flag', 'Conv. goals (60d)'];
+                 'Decay trend', 'Segment', 'Flag', 'Conv. goals (60d)'];
   sh.getRange(2, 1, 1, headers.length).setValues([headers]);
   headerBand_(sh, 2, headers.length);
 
