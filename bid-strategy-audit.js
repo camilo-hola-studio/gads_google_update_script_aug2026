@@ -41,6 +41,11 @@
  * daily/weekly performance), Campaign Data.
  */
 
+// Bumped on every release. Written into the sheet subtitles and the logs so
+// a workbook always says which script version produced it - if the sheet
+// shows an older stamp, the paste didn't take.
+var SCRIPT_VERSION = 'v9 (2026-08-14)';
+
 // ---------------------------------------------------------------------------
 // CONFIG — the only block you should need to touch.
 // ---------------------------------------------------------------------------
@@ -67,11 +72,10 @@ var CONFIG = {
   BUDGET_LIMITED_THRESHOLD: 0.85,
 
   // Change tracking: the change-history table + yellow change dots on the
-  // Targets-vs-Actuals charts. OFF by default: the tab then keeps only the
-  // daily/weekly target-vs-actual charts with the campaign filter. Flip to
-  // true to pull the account's change log again (retains 30 days;
-  // archived in-sheet across runs).
-  TRACK_CHANGES: false,
+  // Targets-vs-Actuals charts. Set false to skip the change-log pull
+  // entirely - the tab then keeps only the daily/weekly target-vs-actual
+  // charts with the campaign filter.
+  TRACK_CHANGES: true,
 
   // Change Impact tab lookback in days (daily chart + fresh change pulls).
   // Capped at 29 in-code: the Google Ads change log (change_event) only
@@ -107,6 +111,7 @@ var TAB_ORDER = ['Summary', 'Actionable', 'Change Impact', 'Campaign Data'];
 // ENTRY POINT
 // ---------------------------------------------------------------------------
 function main() {
+  Logger.log('Bid strategy audit - script ' + SCRIPT_VERSION);
   var account = AdsApp.currentAccount();
   var tz = account.getTimeZone();
   var currency = account.getCurrencyCode();
@@ -922,7 +927,7 @@ function buildSummaryTab_(ss, list, account, ranges, primaryMetric, currency,
          account.getCustomerId() + ')', 12);
   subtitle_(sh, 2, 'Run ' + ranges.base.end + ' | Windows: 60/30/14/7 days ending ' +
             ranges.base.end + ' | Primary metric: ' + primaryMetric +
-            ' | All money in ' + currency);
+            ' | All money in ' + currency + ' | script ' + SCRIPT_VERSION);
 
   // ---- Helper tables the pie charts reference (kept far right, visible). ----
   var withT = list.filter(function(c) { return c.hasTarget; });
@@ -1416,12 +1421,13 @@ function buildChangeImpactTab_(ss, list, primaryMetric, currency, daily,
          'Table: every change this sheet has ever seen, with performance 7 ' +
          'days before vs after - fresh pulls reach back ' +
          daily.dates.length + ' days (the API keeps only 30) and are ' +
-         'archived in the sheet across runs. All money in ' + currency + '.')
+         'archived in the sheet across runs. All money in ' + currency +
+         '. | script ' + SCRIPT_VERSION)
       : ('Navy = current stated target (cost-weighted across the filtered ' +
          'campaigns), light blue = actual ' + primaryMetric + '. Use the ' +
          'Campaign filter to drill into any single campaign - both charts ' +
          'recompute live, no script re-run needed. All money in ' +
-         currency + '.'));
+         currency + '. | script ' + SCRIPT_VERSION));
 
   if (!daily.rows.length) {
     sh.getRange(4, 1).setValue('No daily performance data available for ' +
